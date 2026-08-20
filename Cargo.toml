@@ -1,0 +1,25 @@
+[package]
+name = "rf-drums"
+description = "Physically modelled drum kit: membranes, coupled heads, shells and plates, with no samples"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Development pin. Until the SDK crates are published independently, a release
+# build swaps this for the RackForge Git revision it supports, exactly as
+# `docs/PLUGIN_DEVELOPMENT.md` in the host repository requires:
+#
+#   rackforge-plugin-sdk = { git = "https://github.com/kalexis1994/rackforge", rev = "<sha>" }
+#
+# The path form is what an adjacent checkout uses while the engine is moving.
+rackforge-plugin-sdk = { path = "../rackforge/crates/rackforge-plugin-sdk" }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"

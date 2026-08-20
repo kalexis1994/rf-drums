@@ -1,0 +1,5 @@
+/target
+/renders
+*.rfplugin
+# Local SDK redirects belong here and never in release metadata.
+/.cargo/config.toml

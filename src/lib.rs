@@ -1,0 +1,721 @@
+//! RF-Drums: a physically modelled drum kit, carrying the Concert Grand's
+//! philosophy to percussion. Every sample is computed, none is recorded, and
+//! `docs/DRUM_MODEL.md` is the ledger: each mechanism names its physics,
+//! each simplification is stated rather than hidden.
+//!
+//! This first milestone is the membrane engine and the toms — the instrument
+//! chosen to be built first because it exercises every new mechanism (2-D
+//! Bessel modes, air loading, the coupled head pair, strike position) and
+//! rings long enough that decay errors are audible. The kick reuses the same
+//! engine with a heavier, shorter voicing. The snare speaks but is HONESTLY
+//! INCOMPLETE: its wires are not modelled yet, and what sounds is the drum
+//! under the snares-off lever. Cymbals are the next phase (low modes +
+//! statistical cloud, per the two-scale plan).
+
+#![cfg_attr(all(target_arch = "wasm32", not(test)), no_std)]
+
+mod math;
+pub mod membrane;
+
+use math::{expf, powf, sincosf};
+use membrane::{
+    BESSEL_ZEROS, MODE_COUNT, air_loaded_ratio, angular_order, couple_heads, modal_norm,
+    strike_shape, volume_displacement,
+};
+use rackforge_plugin_sdk::{MidiEvent, ParameterEvent, Processor, export_processor};
+
+/// Simultaneous drum voices. A kit is not a piano: eight covers a two-handed
+/// roll across the kit with the kick underneath, and each voice carries at
+/// most `VOICE_MODES` oscillators, so the whole bank is far below the fuel
+/// ceiling the Concert Grand taught us to respect.
+const MAX_VOICES: usize = 8;
+
+/// Modes per voice: the 45 membrane families, plus the upper partner of each
+/// breathing-mode pair (the two-head split doubles only the five `(0, n)`
+/// modes — the `cos(mθ)` families sweep no volume and have no partner).
+const VOICE_MODES: usize = MODE_COUNT + membrane::RADIAL_ORDERS;
+
+/// A struck mode below this magnitude² is spent; retired at block edges,
+/// exactly the Concert Grand's cull.
+const DEAD_MAGNITUDE_SQUARED: f32 = 1e-9;
+const CULL_INTERVAL: u32 = 256;
+
+// Parameters. The set is deliberately small until calibration exists —
+// a control that cannot be measured against anything is a lie with a knob.
+const PARAM_TUNE: u32 = 0;
+const PARAM_DAMP: u32 = 1;
+const PARAM_POSITION: u32 = 2;
+const PARAM_LEVEL: u32 = 3;
+/// Read by the packaging step when it writes `metadata/parameters.json`.
+pub const PARAM_COUNT: usize = 4;
+
+/// One damped quadrature oscillator — the Concert Grand's `Component`,
+/// unchanged: rotation matrix pre-scaled by the per-sample decay, four
+/// multiplies and two adds per sample, no envelope, no transcendentals in
+/// the audio loop.
+#[derive(Clone, Copy, Default)]
+struct Mode {
+    s: f32,
+    c: f32,
+    rc: f32,
+    rs: f32,
+}
+
+impl Mode {
+    /// Starts from the state a strike leaves: zero displacement, full
+    /// velocity — a struck membrane, like a struck string, leaves the
+    /// contact moving, not displaced.
+    fn strike(amp: f32, frequency: f32, decay_per_sample: f32, sample_rate: f32) -> Self {
+        if amp == 0.0 || frequency <= 0.0 || frequency >= 0.5 * sample_rate {
+            return Self::default();
+        }
+        let omega = core::f32::consts::TAU * frequency / sample_rate;
+        let (sin, cos) = sincosf(omega);
+        Self { s: 0.0, c: amp, rc: decay_per_sample * cos, rs: decay_per_sample * sin }
+    }
+
+    #[inline(always)]
+    fn tick(&mut self) -> f32 {
+        let s = self.s * self.rc + self.c * self.rs;
+        let c = self.c * self.rc - self.s * self.rs;
+        self.s = s;
+        self.c = c;
+        s
+    }
+
+    fn magnitude_squared(&self) -> f32 {
+        self.s * self.s + self.c * self.c
+    }
+
+    fn retire(&mut self) {
+        *self = Self::default();
+    }
+
+    fn is_live(&self) -> bool {
+        self.rc != 0.0 || self.rs != 0.0
+    }
+}
+
+/// What kind of drum a voice is: a preset of the one membrane engine.
+///
+/// Every number here is a PLACEHOLDER VOICING, stated as such: plausible
+/// physical ranges, not measurements. The calibration phase (targets
+/// extracted from recorded kits, the piano's `extract-piano-targets.py`
+/// method) replaces them; until then the model's claim is the *mechanisms*,
+/// not these values.
+#[derive(Clone, Copy)]
+struct DrumSpec {
+    /// The (1,1) mode's frequency — the drum's perceived pitch.
+    pitch_hz: f32,
+    /// Air-mass loading β of the (1,1) mode. Kettledrum ≈ 3.8 (derived in
+    /// `membrane`), toms well under 1, a thick kick head lower still.
+    air_load: f32,
+    /// The cavity spring's share for the breathing-mode split, `2K/ω²`.
+    cavity_stiffness: f32,
+    /// T60 of the (1,1) mode, seconds. Higher modes die faster on the
+    /// membrane loss curve below.
+    t60_s: f32,
+    /// How steeply loss climbs with frequency (exponent on f/pitch).
+    loss_slope: f32,
+    /// Contact time of the stick or beater at full velocity, seconds. Soft
+    /// blows lengthen it — the same touch-to-timbre road the piano's felt
+    /// drives, rendered here as a low-pass over the modal amplitudes whose
+    /// cutoff is the reciprocal of the contact (stated simplification: the
+    /// full nonlinear stick-membrane integration is a later phase; the
+    /// piano's `simulate_strike` is the template when it comes).
+    contact_s: f32,
+    /// Default strike radius (fraction of head radius) when the position
+    /// parameter sits at its centre detent.
+    strike_radius: f32,
+    /// Overall voicing gain.
+    gain: f32,
+}
+
+/// General MIDI percussion map, the subset this milestone voices.
+fn spec_for_note(note: u8) -> Option<DrumSpec> {
+    Some(match note {
+        // Kick 20": both heads heavy, ported, damped — the tone is mostly
+        // the breathing pair plus the beater's thump.
+        35 | 36 => DrumSpec {
+            pitch_hz: 55.0,
+            air_load: 1.2,
+            cavity_stiffness: 0.9,
+            t60_s: 0.35,
+            loss_slope: 1.6,
+            contact_s: 0.008,
+            strike_radius: 0.10,
+            gain: 1.6,
+        },
+        // Snare 14" — WIRES NOT YET MODELLED; this is the drum with the
+        // snares thrown off, and the ledger says so.
+        38 | 40 => DrumSpec {
+            pitch_hz: 180.0,
+            air_load: 0.35,
+            cavity_stiffness: 0.55,
+            t60_s: 0.5,
+            loss_slope: 1.2,
+            contact_s: 0.0018,
+            strike_radius: 0.45,
+            gain: 1.0,
+        },
+        // Floor tom 16"
+        41 | 43 => DrumSpec {
+            pitch_hz: 82.0,
+            air_load: 0.6,
+            cavity_stiffness: 0.5,
+            t60_s: 1.3,
+            loss_slope: 1.3,
+            contact_s: 0.0025,
+            strike_radius: 0.4,
+            gain: 1.25,
+        },
+        // Low tom 13"
+        45 | 47 => DrumSpec {
+            pitch_hz: 110.0,
+            air_load: 0.5,
+            cavity_stiffness: 0.5,
+            t60_s: 1.0,
+            loss_slope: 1.3,
+            contact_s: 0.002,
+            strike_radius: 0.4,
+            gain: 1.15,
+        },
+        // High tom 12"
+        48 | 50 => DrumSpec {
+            pitch_hz: 140.0,
+            air_load: 0.45,
+            cavity_stiffness: 0.5,
+            t60_s: 0.8,
+            loss_slope: 1.3,
+            contact_s: 0.0018,
+            strike_radius: 0.4,
+            gain: 1.1,
+        },
+        _ => return None,
+    })
+}
+
+#[derive(Clone, Copy)]
+struct Voice {
+    modes: [Mode; VOICE_MODES],
+    active: bool,
+    note: u8,
+    age: u32,
+}
+
+impl Default for Voice {
+    fn default() -> Self {
+        Self { modes: [Mode::default(); VOICE_MODES], active: false, note: 0, age: 0 }
+    }
+}
+
+pub struct RfDrums {
+    voices: [Voice; MAX_VOICES],
+    sample_rate: f32,
+    since_cull: u32,
+    // Parameters, all 0..1 with a documented mapping.
+    tune: f32,
+    damp: f32,
+    position: f32,
+    level: f32,
+}
+
+impl Default for RfDrums {
+    fn default() -> Self {
+        Self {
+            voices: [Voice::default(); MAX_VOICES],
+            sample_rate: 48_000.0,
+            since_cull: 0,
+            tune: 0.5,
+            damp: 0.5,
+            position: 0.5,
+            level: 0.8,
+        }
+    }
+}
+
+impl RfDrums {
+    /// Membrane loss curve: T60 of a mode at `ratio` times the pitch.
+    ///
+    /// Mylar's internal losses plus air radiation both climb with frequency;
+    /// the drum's high modes die first, which is why a tom darkens as it
+    /// rings — the same shape as the piano's decay-against-frequency curve,
+    /// with the same discipline owed: ONE curve, refit against measured
+    /// targets when they exist. Placeholder form, stated as such.
+    fn mode_t60(spec: &DrumSpec, ratio: f32, damp: f32) -> f32 {
+        // damp 0..1 swings the whole curve half a decade around the voicing.
+        let user = powf(10.0, 0.5 - damp);
+        spec.t60_s * user / (1.0 + powf(ratio - 1.0, spec.loss_slope.max(1.0)).max(0.0))
+    }
+
+    fn strike(&mut self, note: u8, velocity: u8) {
+        let Some(spec) = spec_for_note(note) else {
+            return;
+        };
+        // Steal the oldest voice; a drum voice is short-lived and a kit
+        // player retriggers the same drum constantly, so same-note steals
+        // its own oldest instance first.
+        let slot = self
+            .voices
+            .iter()
+            .position(|voice| !voice.active)
+            .unwrap_or_else(|| {
+                // All busy: steal the oldest instance of the same drum if one
+                // is ringing, else the oldest voice overall.
+                let oldest = |indices: &mut dyn Iterator<Item = usize>| {
+                    indices.max_by_key(|&index| self.voices[index].age)
+                };
+                let mut same_note =
+                    (0..MAX_VOICES).filter(|&index| self.voices[index].note == note);
+                oldest(&mut same_note)
+                    .or_else(|| oldest(&mut (0..MAX_VOICES)))
+                    .unwrap_or(0)
+            });
+        let voice = &mut self.voices[slot];
+        *voice = Voice::default();
+        voice.active = true;
+        voice.note = note;
+
+        let velocity_01 = velocity as f32 / 127.0;
+        // Tune swings the pitch ±5 semitones around the voicing.
+        let pitch = spec.pitch_hz * powf(2.0, (self.tune - 0.5) * 10.0 / 12.0);
+        // Strike position: the parameter sweeps centre → rim around the
+        // voicing's default. This is the 5-zone story made continuous — the
+        // zones are just names for stretches of this axis.
+        let radius = (spec.strike_radius + (self.position - 0.5) * 0.9).clamp(0.02, 0.98);
+        // Contact time lengthens for soft blows (a stick thrown gently sinks
+        // into the head longer), shortening — brightening — with velocity.
+        let contact = spec.contact_s * (1.6 - 0.8 * velocity_01);
+        // Second-order low-pass over modal amplitudes at the contact's
+        // reciprocal: the stick's finite dwell cannot feed modes whose
+        // period it straddles. Same construction as the piano's felt filter.
+        let cutoff = 1.0 / (core::f32::consts::PI * contact);
+
+        let f11 = pitch;
+        let velocity_amp = 0.12 * spec.gain * (0.25 + 0.75 * velocity_01 * velocity_01);
+
+        for (index, &alpha) in BESSEL_ZEROS.iter().enumerate() {
+            let m = angular_order(index);
+            let frequency = f11 * air_loaded_ratio(alpha, spec.air_load);
+            let shape = strike_shape(m, alpha, radius, 0.0);
+            let norm = modal_norm(m, alpha);
+            if norm <= 0.0 {
+                continue;
+            }
+            // Amplitude: projection over modal mass, through the contact's
+            // low-pass. The radiated weight of high-m modes falls as their
+            // cancelling lobes shorten; a first-order 1/(1+m/4) stands in
+            // for the multipole radiation roll-off (stated placeholder —
+            // proper piston-in-baffle weights come with calibration).
+            let ratio = frequency / cutoff;
+            let contact_lp = 1.0 / (1.0 + ratio * ratio);
+            let radiation = 1.0 / (1.0 + m as f32 * 0.25);
+            let amp = velocity_amp * shape / norm * contact_lp * radiation;
+            if amp.abs() < 1e-6 {
+                continue;
+            }
+            let ratio_11 = frequency / f11;
+            let t60 = Self::mode_t60(&spec, ratio_11, self.damp);
+            let decay = decay_per_sample(t60, self.sample_rate);
+            if m == 0 {
+                // The breathing pair: this head's (0,n) splits against the
+                // resonant head through the cavity. Both partners speak;
+                // the upper (air-stiffened) one carries the attack's punch
+                // and dies a little faster, the lower carries the boom.
+                let (lower, upper) = couple_heads(frequency, spec.cavity_stiffness);
+                let swept = volume_displacement(m, alpha).abs();
+                let n_index = index - (m as usize) * membrane::RADIAL_ORDERS;
+                voice.modes[index] =
+                    Mode::strike(amp * 0.6, lower, decay, self.sample_rate);
+                let upper_t60 = t60 * 0.7;
+                let upper_decay = decay_per_sample(upper_t60, self.sample_rate);
+                voice.modes[MODE_COUNT + n_index] = Mode::strike(
+                    amp * 0.55 * (0.5 + swept),
+                    upper,
+                    upper_decay,
+                    self.sample_rate,
+                );
+            } else {
+                voice.modes[index] = Mode::strike(amp, frequency, decay, self.sample_rate);
+            }
+        }
+    }
+
+    fn handle_midi(&mut self, event: &MidiEvent) {
+        match event.data[0] & 0xf0 {
+            0x90 if event.data[2] > 0 => self.strike(event.data[1], event.data[2]),
+            // Note-off is meaningless on a drum; choking (hi-hat, cymbal
+            // grab) arrives with the cymbal phase.
+            _ => {}
+        }
+    }
+
+    fn cull(&mut self) {
+        for voice in self.voices.iter_mut() {
+            if !voice.active {
+                continue;
+            }
+            voice.age = voice.age.saturating_add(1);
+            let mut live = false;
+            for mode in voice.modes.iter_mut() {
+                if !mode.is_live() {
+                    continue;
+                }
+                if mode.magnitude_squared() < DEAD_MAGNITUDE_SQUARED {
+                    mode.retire();
+                } else {
+                    live = true;
+                }
+            }
+            if !live {
+                voice.active = false;
+            }
+        }
+    }
+
+    fn set(&mut self, index: u32, value: f64) -> bool {
+        let value = value as f32;
+        match index {
+            PARAM_TUNE => self.tune = value.clamp(0.0, 1.0),
+            PARAM_DAMP => self.damp = value.clamp(0.0, 1.0),
+            PARAM_POSITION => self.position = value.clamp(0.0, 1.0),
+            PARAM_LEVEL => self.level = value.clamp(0.0, 1.0),
+            _ => return false,
+        }
+        true
+    }
+
+    fn get(&self, index: u32) -> Option<f64> {
+        Some(match index {
+            PARAM_TUNE => self.tune as f64,
+            PARAM_DAMP => self.damp as f64,
+            PARAM_POSITION => self.position as f64,
+            PARAM_LEVEL => self.level as f64,
+            _ => return None,
+        })
+    }
+}
+
+fn decay_per_sample(t60: f32, sample_rate: f32) -> f32 {
+    // e^(−ln(1000)/(T60·rate)); ln(1000) = 6.9078.
+    expf(-6.907_755 / (t60.max(0.01) * sample_rate))
+}
+
+impl Processor for RfDrums {
+    fn prepare(
+        &mut self,
+        sample_rate: f64,
+        _maximum_frames: u32,
+        _input_channels: u32,
+        output_channels: u32,
+    ) -> bool {
+        if output_channels < 1 {
+            return false;
+        }
+        self.sample_rate = sample_rate as f32;
+        self.reset();
+        true
+    }
+
+    fn set_parameter(&mut self, index: u32, value: f64) -> bool {
+        self.set(index, value)
+    }
+
+    fn get_parameter(&self, index: u32) -> Option<f64> {
+        self.get(index)
+    }
+
+    fn reset(&mut self) {
+        self.voices = [Voice::default(); MAX_VOICES];
+        self.since_cull = 0;
+    }
+
+    fn process(
+        &mut self,
+        _input: &[f32],
+        output: &mut [f32],
+        midi: &[MidiEvent],
+        parameters: &[ParameterEvent],
+        frames: u32,
+        _input_channels: u32,
+        output_channels: u32,
+    ) {
+        let channels = output_channels as usize;
+        let level = self.level * self.level;
+        let mut midi_index = 0;
+        let mut parameter_index = 0;
+        for frame in 0..frames as usize {
+            while let Some(event) = midi.get(midi_index) {
+                if event.frame as usize != frame {
+                    break;
+                }
+                self.handle_midi(event);
+                midi_index += 1;
+            }
+            while let Some(event) = parameters.get(parameter_index) {
+                if event.frame as usize != frame {
+                    break;
+                }
+                let _ = self.set(event.index, event.value);
+                parameter_index += 1;
+            }
+            let mut sum = 0.0f32;
+            for voice in self.voices.iter_mut() {
+                if !voice.active {
+                    continue;
+                }
+                for mode in voice.modes.iter_mut() {
+                    sum += mode.tick();
+                }
+            }
+            let sample = soft_clip(sum * level);
+            for channel in 0..channels {
+                output[frame * channels + channel] = sample;
+            }
+            self.since_cull += 1;
+            if self.since_cull >= CULL_INTERVAL {
+                self.since_cull = 0;
+                self.cull();
+            }
+        }
+    }
+}
+
+/// The same output guard the host expects of every instrument: a tanh-like
+/// rational soft clip, unity below the knee.
+fn soft_clip(x: f32) -> f32 {
+    let x = x.clamp(-3.0, 3.0);
+    x * (27.0 + x * x) / (27.0 + 9.0 * x * x)
+}
+
+export_processor!(
+    RfDrums,
+    max_frames = 4096,
+    max_input_channels = 0,
+    max_output_channels = 2,
+    max_midi_events = 256,
+    max_parameter_events = 256,
+    max_transfer_bytes = 4096
+);
+
+#[cfg(all(target_arch = "wasm32", not(test)))]
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {
+    core::arch::wasm32::unreachable()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn render(drums: &mut RfDrums, frames: usize, midi: &[MidiEvent]) -> Vec<f32> {
+        let mut output = vec![0.0f32; frames * 2];
+        let mut done = 0;
+        let mut first = true;
+        while done < frames {
+            let block = (frames - done).min(512);
+            let events: &[MidiEvent] = if first { midi } else { &[] };
+            let start = done * 2;
+            drums.process(&[], &mut output[start..start + block * 2], events, &[], block as u32, 0, 2);
+            first = false;
+            done += block;
+        }
+        output
+    }
+
+    fn strike(note: u8, velocity: u8) -> Vec<MidiEvent> {
+        vec![MidiEvent { frame: 0, data: [0x99, note, velocity], length: 3 }]
+    }
+
+    /// Goertzel band energy, mono mix.
+    fn band_energy(samples: &[f32], rate: f32, low: f32, high: f32) -> f32 {
+        let mono: Vec<f32> = samples.chunks(2).map(|f| 0.5 * (f[0] + f[1])).collect();
+        let n = mono.len();
+        let mut total = 0.0f64;
+        let mut f = low;
+        while f < high {
+            let omega = core::f32::consts::TAU * f / rate;
+            let coeff = 2.0 * omega.cos();
+            let (mut s1, mut s2) = (0.0f32, 0.0f32);
+            for &x in &mono {
+                let s0 = x + coeff * s1 - s2;
+                s2 = s1;
+                s1 = s0;
+            }
+            let power = (s1 * s1 + s2 * s2 - coeff * s1 * s2) as f64 / n as f64;
+            total += power;
+            f *= 1.06; // ~semitone steps
+        }
+        total as f32
+    }
+
+    #[test]
+    fn a_tom_speaks_and_dies() {
+        let mut drums = RfDrums::default();
+        assert!(drums.prepare(48_000.0, 512, 0, 2));
+        let out = render(&mut drums, 48_000 * 3, &strike(41, 110));
+        let peak = out.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
+        assert!(peak > 0.01, "silent tom, peak {peak}");
+        assert!(peak < 1.0, "clipping tom, peak {peak}");
+        assert!(out.iter().all(|x| x.is_finite()), "non-finite output");
+        // The last half second must be far below the first.
+        let early = band_energy(&out[..48_000], 48_000.0, 40.0, 4000.0);
+        let late = band_energy(&out[out.len() - 48_000..], 48_000.0, 40.0, 4000.0);
+        assert!(
+            late < early * 0.05,
+            "tom does not decay: early {early}, late {late}"
+        );
+    }
+
+    /// The tom's spectrum must peak near its air-loaded mode frequencies and
+    /// hold energy in the inharmonic upper ladder — a membrane, not a sine.
+    #[test]
+    fn the_tom_is_a_membrane_not_an_oscillator() {
+        let mut drums = RfDrums::default();
+        assert!(drums.prepare(48_000.0, 512, 0, 2));
+        let out = render(&mut drums, 48_000, &strike(41, 110));
+        let fundamental = band_energy(&out, 48_000.0, 70.0, 100.0);
+        let upper = band_energy(&out, 48_000.0, 120.0, 400.0);
+        assert!(fundamental > 0.0);
+        // The (2,1)/(0,2)/(3,1) region of an 82 Hz tom lives roughly
+        // 110–250 Hz; a sine would have nothing there.
+        assert!(
+            upper > fundamental * 0.05,
+            "no upper ladder: fundamental {fundamental}, upper {upper}"
+        );
+    }
+
+    /// Centre versus edge: the strike position must change which modes exist.
+    /// At the centre only the breathing family speaks; at the rim the m ≥ 1
+    /// ladder takes over. This is the model's core claim over a 3-zone
+    /// sample library, so it is tested, not assumed.
+    #[test]
+    fn strike_position_changes_the_spectrum() {
+        let render_at = |position: f64| {
+            let mut drums = RfDrums::default();
+            assert!(drums.prepare(48_000.0, 512, 0, 2));
+            assert!(drums.set_parameter(PARAM_POSITION, position));
+            render(&mut drums, 48_000, &strike(41, 110))
+        };
+        // position 0 pulls the radius to the centre clamp, 1.0 to the rim.
+        let centre = render_at(0.0);
+        let rim = render_at(1.0);
+        // (1,1) of the 82 Hz tom sits at the pitch; the breathing (0,1)
+        // sits well below it (air-loaded, ~0.55×).
+        let centre_ring = band_energy(&centre, 48_000.0, 74.0, 92.0);
+        let centre_thud = band_energy(&centre, 48_000.0, 38.0, 58.0);
+        let rim_ring = band_energy(&rim, 48_000.0, 74.0, 92.0);
+        let rim_thud = band_energy(&rim, 48_000.0, 38.0, 58.0);
+        let centre_balance = centre_ring / centre_thud;
+        let rim_balance = rim_ring / rim_thud;
+        assert!(
+            rim_balance > centre_balance * 3.0,
+            "position does nothing: centre {centre_balance}, rim {rim_balance}"
+        );
+    }
+
+    /// Velocity must brighten, not just louden — the contact filter at work.
+    #[test]
+    fn a_hard_blow_is_brighter_than_a_soft_one() {
+        let render_at = |velocity: u8| {
+            let mut drums = RfDrums::default();
+            assert!(drums.prepare(48_000.0, 512, 0, 2));
+            render(&mut drums, 24_000, &strike(41, velocity))
+        };
+        let soft = render_at(30);
+        let hard = render_at(120);
+        let brightness = |out: &[f32]| {
+            let low = band_energy(out, 48_000.0, 60.0, 200.0);
+            let high = band_energy(out, 48_000.0, 300.0, 1500.0);
+            high / low.max(1e-12)
+        };
+        let soft_ratio = brightness(&soft);
+        let hard_ratio = brightness(&hard);
+        assert!(
+            hard_ratio > soft_ratio * 1.3,
+            "velocity does not brighten: soft {soft_ratio}, hard {hard_ratio}"
+        );
+    }
+
+    /// The kick and every tom must speak; unmapped notes must not.
+    #[test]
+    fn the_map_speaks_where_it_claims_to() {
+        for note in [36u8, 38, 41, 45, 48] {
+            let mut drums = RfDrums::default();
+            assert!(drums.prepare(48_000.0, 512, 0, 2));
+            let out = render(&mut drums, 4800, &strike(note, 100));
+            let peak = out.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
+            assert!(peak > 0.005, "note {note} silent, peak {peak}");
+        }
+        let mut drums = RfDrums::default();
+        assert!(drums.prepare(48_000.0, 512, 0, 2));
+        let out = render(&mut drums, 4800, &strike(60, 100));
+        let peak = out.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
+        assert!(peak == 0.0, "unmapped note speaks, peak {peak}");
+    }
+
+    /// A fast roll across the kit must neither trap nor clip nor leak NaN —
+    /// the Concert Grand's stress lesson, applied from day one.
+    #[test]
+    fn a_roll_across_the_kit_survives() {
+        let mut drums = RfDrums::default();
+        assert!(drums.prepare(48_000.0, 512, 0, 2));
+        let mut output = vec![0.0f32; 512 * 2];
+        let notes = [36u8, 38, 41, 45, 48, 38, 36, 41];
+        for round in 0..200u32 {
+            let note = notes[(round as usize) % notes.len()];
+            let velocity = 60 + ((round * 13) % 67) as u8;
+            let events = [MidiEvent { frame: 0, data: [0x99, note, velocity], length: 3 }];
+            drums.process(&[], &mut output, &events, &[], 512, 0, 2);
+            assert!(
+                output.iter().all(|x| x.is_finite() && x.abs() <= 1.0),
+                "round {round} produced bad samples"
+            );
+        }
+    }
+
+    /// Not a test: renders each drum to a WAV for listening and calibration.
+    /// RF_DRUMS_RENDER=/path/to/dir cargo test --release render_wavs -- --ignored
+    #[test]
+    #[ignore]
+    fn render_wavs() {
+        let Ok(out_dir) = std::env::var("RF_DRUMS_RENDER") else {
+            eprintln!("set RF_DRUMS_RENDER to an output directory");
+            return;
+        };
+        for (name, note, velocity, seconds) in [
+            ("kick", 36u8, 115u8, 2.0f32),
+            ("kick-soft", 36, 50, 2.0),
+            ("snare-nowires", 38, 110, 2.0),
+            ("floor-tom", 41, 110, 4.0),
+            ("floor-tom-soft", 41, 45, 4.0),
+            ("low-tom", 45, 110, 3.0),
+            ("high-tom", 48, 110, 3.0),
+        ] {
+            let mut drums = RfDrums::default();
+            assert!(drums.prepare(48_000.0, 512, 0, 2));
+            let frames = (48_000.0 * seconds) as usize;
+            let out = render(&mut drums, frames, &strike(note, velocity));
+            // Mono mix, 16-bit PCM WAV.
+            let mono: Vec<f32> = out.chunks(2).map(|f| 0.5 * (f[0] + f[1])).collect();
+            let mut bytes: Vec<u8> = Vec::new();
+            let data_len = (mono.len() * 2) as u32;
+            bytes.extend(b"RIFF");
+            bytes.extend((36 + data_len).to_le_bytes());
+            bytes.extend(b"WAVEfmt ");
+            bytes.extend(16u32.to_le_bytes());
+            bytes.extend(1u16.to_le_bytes());
+            bytes.extend(1u16.to_le_bytes());
+            bytes.extend(48_000u32.to_le_bytes());
+            bytes.extend((48_000u32 * 2).to_le_bytes());
+            bytes.extend(2u16.to_le_bytes());
+            bytes.extend(16u16.to_le_bytes());
+            bytes.extend(b"data");
+            bytes.extend(data_len.to_le_bytes());
+            for sample in &mono {
+                bytes.extend(((sample.clamp(-1.0, 1.0) * 32_767.0) as i16).to_le_bytes());
+            }
+            std::fs::write(format!("{out_dir}/{name}.wav"), bytes).unwrap();
+        }
+    }
+}
