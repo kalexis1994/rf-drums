@@ -16,7 +16,7 @@ Milestone 1: the membrane engine and the toms.
   through the cavity's breathing modes.
 - Continuous strike position (centre thud → rim ring) — the model's core
   advantage over zoned samples.
-- Voices: kick (35/36), snare **without wires yet** (38/40), floor tom
+- Voices: kick (35/36), snare with a collective wire model (38/40), floor tom
   (41/43), low tom (45/47), high tom (48/50) on the GM percussion map.
 - Cymbals are the next phase (two-scale: low modes + statistical cloud).
 

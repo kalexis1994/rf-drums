@@ -7,17 +7,17 @@
 //! chosen to be built first because it exercises every new mechanism (2-D
 //! Bessel modes, air loading, the coupled head pair, strike position) and
 //! rings long enough that decay errors are audible. The kick reuses the same
-//! engine with a heavier, shorter voicing. The snare speaks but is HONESTLY
-//! INCOMPLETE: its wires are not modelled yet, and what sounds is the drum
-//! under the snares-off lever. Cymbals are the next phase (low modes +
-//! statistical cloud, per the two-scale plan).
+//! engine with a heavier, shorter voicing. The snare carries a stated
+//! collective wire model; individual wire collisions remain future work.
+//! Cymbals are the next phase (low modes + statistical cloud, per the
+//! two-scale plan).
 
 #![cfg_attr(all(target_arch = "wasm32", not(test)), no_std)]
 
 mod math;
 pub mod membrane;
 
-use math::{expf, powf, sincosf, sqrtf};
+use math::{expf, powf, roundf, sincosf, sqrtf};
 use membrane::{
     BESSEL_ZEROS, MODE_COUNT, air_loaded_ratio, angular_order, couple_detuned_heads,
     modal_norm, strike_shape, volume_displacement,
@@ -70,13 +70,11 @@ const CONTACT_BRIGHTNESS: f32 = 8.0;
 /// displacement, so every mode starts sharp by the same fraction and
 /// settles as the amplitude dies — Kirchhoff–Carrier, the piano's ff glide
 /// one instrument over, but far larger here because a drumhead moves
-/// millimetres where a string moves tenths. The fortissimo onset reaches
-/// GLIDE_MAX (≈ +1 semitone) and relaxes with GLIDE_TAU. Placeholder
-/// values in the measured order of magnitude for toms; the 808 fakes this
-/// very curve with a pitch envelope, which is why a model without it reads
-/// as the 808 and not as the drum.
-const GLIDE_MAX: f32 = 0.06;
-const GLIDE_TAU_S: f32 = 0.05;
+/// millimetres where a string moves tenths. Onset amount and relaxation are
+/// part of each `DrumSpec`: a loose floor tom bends farther and longer than
+/// a tight snare. The 808 fakes this very curve with a pitch envelope, which
+/// is why a model without it reads as the 808 and not as the drum.
+///
 /// The twins' tension split, as a fraction of each mode's frequency, and
 /// the per-mode jitter around it — a uniform split would make every pair
 /// beat at a rate proportional to frequency, the piano's "shimmer" defect.
@@ -162,7 +160,7 @@ const DIRECT_BUFFER: usize = 64;
 // will not list these; they are the calibration surface, not the panel.
 pub const SPEC_PARAM_BASE: u32 = 16;
 pub const SPEC_PARAM_STRIDE: u32 = 16;
-pub const SPEC_FIELDS: u32 = 13;
+pub const SPEC_FIELDS: u32 = 15;
 const FIELD_PITCH_HZ: u32 = 0;
 const FIELD_AIR_LOAD: u32 = 1;
 const FIELD_CAVITY: u32 = 2;
@@ -176,6 +174,8 @@ const FIELD_SHELL: u32 = 9;
 const FIELD_RES_TUNE: u32 = 10;
 const FIELD_PORT: u32 = 11;
 const FIELD_WIRES: u32 = 12;
+const FIELD_GLIDE: u32 = 13;
+const FIELD_GLIDE_TAU: u32 = 14;
 
 /// One damped quadrature oscillator — the Concert Grand's `Component`,
 /// unchanged: rotation matrix pre-scaled by the per-sample decay, four
@@ -194,7 +194,7 @@ impl Mode {
     /// velocity — a struck membrane, like a struck string, leaves the
     /// contact moving, not displaced.
     fn strike(amp: f32, frequency: f32, decay_per_sample: f32, sample_rate: f32) -> Self {
-        if amp == 0.0 || frequency <= 0.0 || frequency >= 0.5 * sample_rate {
+        if frequency <= 0.0 || frequency >= 0.5 * sample_rate {
             return Self::default();
         }
         let omega = core::f32::consts::TAU * frequency / sample_rate;
@@ -277,6 +277,12 @@ struct DrumSpec {
     /// The snare wires' level. Zero everywhere but the snare; the model is
     /// collective (see `Voice::wire_tick`), not per-wire.
     wires: f32,
+    /// Fractional onset sharpening at a full-velocity strike. Tension
+    /// modulation is strongly body-dependent: a loose floor-tom head bends
+    /// farther, and for longer, than a tight snare head.
+    glide: f32,
+    /// Time constant of the pitch relaxation, seconds.
+    glide_tau_s: f32,
 }
 
 /// The drums the kit voices, in spec-table order.
@@ -315,9 +321,11 @@ fn default_specs() -> [DrumSpec; DRUM_COUNT] {
             res_tune: 0.90,
             port: 0.8,
             wires: 0.0,
+            glide: 0.10,
+            glide_tau_s: 0.09,
         },
-        // Snare 14" — WIRES NOT YET MODELLED; this is the drum with the
-        // snares thrown off, and the ledger says so.
+        // Snare 14" — collective wire collision model; the ledger names
+        // what remains before this becomes a per-wire simulation.
         DrumSpec {
             pitch_hz: 180.0,
             air_load: 0.35,
@@ -332,6 +340,8 @@ fn default_specs() -> [DrumSpec; DRUM_COUNT] {
             res_tune: 1.35,
             port: 0.0,
             wires: 1.2,
+            glide: 0.025,
+            glide_tau_s: 0.035,
         },
         // Floor tom 16"
         DrumSpec {
@@ -348,6 +358,8 @@ fn default_specs() -> [DrumSpec; DRUM_COUNT] {
             res_tune: 0.94,
             port: 0.0,
             wires: 0.0,
+            glide: 0.085,
+            glide_tau_s: 0.11,
         },
         // Low tom 13"
         DrumSpec {
@@ -364,6 +376,8 @@ fn default_specs() -> [DrumSpec; DRUM_COUNT] {
             res_tune: 0.95,
             port: 0.0,
             wires: 0.0,
+            glide: 0.07,
+            glide_tau_s: 0.09,
         },
         // High tom 12"
         DrumSpec {
@@ -380,6 +394,8 @@ fn default_specs() -> [DrumSpec; DRUM_COUNT] {
             res_tune: 0.95,
             port: 0.0,
             wires: 0.0,
+            glide: 0.055,
+            glide_tau_s: 0.07,
         },
     ]
 }
@@ -400,6 +416,8 @@ impl DrumSpec {
             FIELD_RES_TUNE => self.res_tune as f64,
             FIELD_PORT => self.port as f64,
             FIELD_WIRES => self.wires as f64,
+            FIELD_GLIDE => self.glide as f64,
+            FIELD_GLIDE_TAU => self.glide_tau_s as f64,
             _ => return None,
         })
     }
@@ -421,6 +439,8 @@ impl DrumSpec {
             FIELD_RES_TUNE => self.res_tune = value.clamp(0.6, 1.6),
             FIELD_PORT => self.port = value.clamp(0.0, 4.0),
             FIELD_WIRES => self.wires = value.clamp(0.0, 8.0),
+            FIELD_GLIDE => self.glide = value.clamp(0.0, 0.2),
+            FIELD_GLIDE_TAU => self.glide_tau_s = value.clamp(0.01, 0.5),
             _ => return false,
         }
         true
@@ -430,6 +450,14 @@ impl DrumSpec {
 #[derive(Clone, Copy)]
 struct Voice {
     modes: [Mode; VOICE_MODES],
+    /// Modal velocity delivered by the current stick/head contact. Unlike
+    /// an impulse that fills every oscillator in one sample, this force is
+    /// spread over a short raised-sine pulse and therefore lets each mode
+    /// rotate while the stick is still pushing the head.
+    drive: [f32; VOICE_MODES],
+    contact_frame: u16,
+    contact_frames: u16,
+    contact_norm: f32,
     /// Each mode's rest frequency (rad/sample) and per-sample decay, kept so
     /// the glide can rebuild `rc`/`rs` at control rate. Rebuilding from the
     /// stored decay is exactly norm-preserving — the piano's tension-glide
@@ -440,11 +468,14 @@ struct Voice {
     /// Current tension sharpening, as a fraction of each mode's frequency;
     /// decays toward zero at control rate.
     glide: f32,
-    /// The crack: an exponentially dying, one-pole-low-passed noise burst.
+    glide_tau_s: f32,
+    /// The crack: an exponentially dying, band-limited noise burst.
     crack_amp: f32,
     crack_decay: f32,
     crack_lp: f32,
+    crack_hp: f32,
     crack_state: f32,
+    crack_low_state: f32,
     rng: u32,
     /// The wires, collectively: gate level fixed at strike, an asymmetric
     /// envelope follower over the head's motion, and a band-pass state pair
@@ -468,13 +499,20 @@ impl Default for Voice {
     fn default() -> Self {
         Self {
             modes: [Mode::default(); VOICE_MODES],
+            drive: [0.0; VOICE_MODES],
+            contact_frame: 0,
+            contact_frames: 0,
+            contact_norm: 0.0,
             omega: [0.0; VOICE_MODES],
             decay: [0.0; VOICE_MODES],
             glide: 0.0,
+            glide_tau_s: 0.05,
             crack_amp: 0.0,
             crack_decay: 0.0,
             crack_lp: 0.0,
+            crack_hp: 0.0,
             crack_state: 0.0,
+            crack_low_state: 0.0,
             rng: 1,
             wires_level: 0.0,
             wire_env: 0.0,
@@ -494,11 +532,55 @@ impl Default for Voice {
 impl Voice {
     /// Installs a struck mode and remembers its rest rotation for the glide.
     fn install(&mut self, index: usize, amp: f32, frequency: f32, decay: f32, rate: f32) {
-        self.modes[index] = Mode::strike(amp, frequency, decay, rate);
+        self.modes[index] = Mode::strike(amp, frequency * (1.0 + self.glide), decay, rate);
         if self.modes[index].is_live() {
             self.omega[index] = core::f32::consts::TAU * frequency / rate;
             self.decay[index] = decay;
         }
+    }
+
+    /// Installs an oscillator at rest and records the velocity that the
+    /// finite stick contact will deliver to it. The target is the same modal
+    /// projection an ideal impulse would leave, but its phase now emerges
+    /// from the actual contact duration.
+    fn install_driven(
+        &mut self,
+        index: usize,
+        amp: f32,
+        frequency: f32,
+        decay: f32,
+        rate: f32,
+    ) {
+        self.install(index, 0.0, frequency, decay, rate);
+        self.drive[index] = amp;
+    }
+
+    fn start_contact(&mut self, contact_s: f32, sample_rate: f32) {
+        // The measured geometric contact is wider than the force peak: the
+        // tip hardens as it compresses. CONTACT_BRIGHTNESS carries that
+        // ratio until measured force traces replace it. The upper bound
+        // keeps an extreme calibration value below one control interval.
+        let frames = roundf(contact_s * sample_rate / CONTACT_BRIGHTNESS)
+            .clamp(2.0, CULL_INTERVAL as f32) as u16;
+        self.contact_frame = 0;
+        self.contact_frames = frames;
+        // Exact normalization for samples sin(pi*(k+1/2)/N): their sum is
+        // csc(pi/(2N)), so multiplying by sin(pi/(2N)) gives unit impulse.
+        let (norm, _) = sincosf(core::f32::consts::PI / (2.0 * frames as f32));
+        self.contact_norm = norm;
+    }
+
+    #[inline(always)]
+    fn contact_tick(&mut self) -> f32 {
+        if self.contact_frame >= self.contact_frames {
+            return 0.0;
+        }
+        let phase = core::f32::consts::PI
+            * (self.contact_frame as f32 + 0.5)
+            / self.contact_frames as f32;
+        self.contact_frame += 1;
+        let (force, _) = sincosf(phase);
+        force * self.contact_norm
     }
 
     /// One control step of tension relaxation: every membrane mode's
@@ -573,9 +655,14 @@ impl Voice {
         }
         self.rng = self.rng.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
         let white = (self.rng >> 8) as f32 * (1.0 / 8_388_608.0) - 1.0;
+        // A stick click is a band, not low-passed DC noise. The first pole
+        // removes ultrasonic grit, the second removes the low body already
+        // carried by the membrane. Their difference is the short woody edge
+        // heard before the head has completed even one cycle.
         self.crack_state += self.crack_lp * (white - self.crack_state);
+        self.crack_low_state += self.crack_hp * (self.crack_state - self.crack_low_state);
         self.crack_amp *= self.crack_decay;
-        self.crack_state * self.crack_amp
+        (self.crack_state - self.crack_low_state) * self.crack_amp
     }
 }
 
@@ -606,6 +693,9 @@ pub struct RfDrums {
     direct_left: [f32; DIRECT_BUFFER],
     direct_right: [f32; DIRECT_BUFFER],
     direct_pos: usize,
+    /// Monotonic within an instance, used only to vary strike bearing and
+    /// contact noise. Modal frequencies remain those of one particular kit.
+    strike_counter: u32,
 }
 
 impl Default for RfDrums {
@@ -631,6 +721,7 @@ impl Default for RfDrums {
             direct_left: [0.0; DIRECT_BUFFER],
             direct_right: [0.0; DIRECT_BUFFER],
             direct_pos: 0,
+            strike_counter: 0,
         }
     }
 }
@@ -654,6 +745,8 @@ impl RfDrums {
             return;
         };
         let spec = self.specs[drum];
+        self.strike_counter = self.strike_counter.wrapping_add(1);
+        let hit_seed = self.strike_counter ^ ((note as u32) << 16) ^ 0x9e37_79b9;
         // Steal the oldest voice; a drum voice is short-lived and a kit
         // player retriggers the same drum constantly, so same-note steals
         // its own oldest instance first.
@@ -684,14 +777,24 @@ impl RfDrums {
         // Strike position: the parameter sweeps centre → rim around the
         // voicing's default. This is the 5-zone story made continuous — the
         // zones are just names for stretches of this axis.
-        let radius = (spec.strike_radius + (self.position - 0.5) * 0.9).clamp(0.02, 0.98);
+        // Even a trained hand does not land on the same molecule twice.
+        // Two percent of radius is enough to break identical-machine-gun
+        // spectra in a roll without turning the position control into a
+        // random zone selector.
+        let radius_jitter = (hash01(hit_seed ^ 0xa511_e9b3) - 0.5) * 0.04;
+        let radius =
+            (spec.strike_radius + (self.position - 0.5) * 0.9 + radius_jitter).clamp(0.02, 0.98);
+        // Bearing selects the cos/sin members of every degenerate family.
+        // The panel exposes radius because that is the strong timbral axis;
+        // bearing varies subtly from hit to hit like a real stick path.
+        let strike_angle = core::f32::consts::TAU * hash01(hit_seed ^ 0x63d8_35f1);
         // Contact time lengthens for soft blows (a stick thrown gently sinks
         // into the head longer), shortening — brightening — with velocity.
-        // The swing is ~3x across the dynamic range (soft ~2.1x the spec
-        // time, hard ~0.7x), the order stick contacts actually span; the
+        // The swing is ~4x across the dynamic range (soft ~2.4x the spec
+        // time, hard ~0.55x), the order stick contacts actually span; the
         // first cut used 1.67x and the velocity-to-timbre road measured
         // almost flat once the room diluted it.
-        let contact = spec.contact_s * (2.2 - 1.5 * velocity_01);
+        let contact = spec.contact_s * (2.45 - 1.9 * velocity_01);
         // Second-order low-pass over modal amplitudes tied to the contact's
         // reciprocal — same construction as the piano's felt filter, and
         // with the piano's empirical brightness factor (see
@@ -705,18 +808,23 @@ impl RfDrums {
         // Tension modulation: the blow stretches the head, the pitch starts
         // sharp and settles. Kirchhoff–Carrier scales with the square of the
         // displacement, so the glide follows velocity².
-        voice.glide = GLIDE_MAX * velocity_01 * velocity_01;
+        voice.glide = spec.glide * velocity_01 * velocity_01;
+        voice.glide_tau_s = spec.glide_tau_s;
 
         // The crack: the stick's own broadband impact, brighter and louder
         // for the hard blow, its bandwidth tied to the same contact time
         // that shapes the modal ladder.
-        let crack_cutoff =
-            (2.5 / (core::f32::consts::TAU * contact)).min(0.45 * self.sample_rate);
-        voice.crack_amp = 0.5 * spec.crack * spec.gain * (0.1 + 0.9 * velocity_01 * velocity_01);
-        voice.crack_decay = expf(-1.0 / (2.5 * contact * self.sample_rate));
+        let crack_cutoff = (12.0 / contact).min(0.45 * self.sample_rate);
+        let crack_floor = (700.0f32).max(4.0 * pitch).min(0.25 * self.sample_rate);
+        voice.crack_amp =
+            1.5 * spec.crack * spec.gain * (0.06 + 0.94 * velocity_01 * velocity_01);
+        voice.crack_decay = expf(-1.0 / (0.75 * contact * self.sample_rate));
         voice.crack_lp =
             1.0 - expf(-core::f32::consts::TAU * crack_cutoff / self.sample_rate);
-        voice.rng = 0x9e37_79b9 ^ ((note as u32) << 8) ^ (velocity as u32);
+        voice.crack_hp =
+            1.0 - expf(-core::f32::consts::TAU * crack_floor / self.sample_rate);
+        voice.rng = hit_seed;
+        voice.start_contact(contact, self.sample_rate);
         // The wires' gate level; the ×4 sets the fader's centre near the
         // audible balance and is voicing, not physics.
         voice.wires_level = spec.wires * 4.0;
@@ -744,6 +852,9 @@ impl RfDrums {
             let frequency = f11
                 * air_loaded_ratio(alpha, spec.air_load)
                 * bending_sharpen(alpha / membrane::ALPHA_11);
+            // At angle zero `strike_shape` is the radial Bessel projection.
+            // The angular share is applied explicitly below so the two
+            // degenerate partners receive cos(mθ) and sin(mθ), respectively.
             let shape = strike_shape(m, alpha, radius, 0.0);
             let norm = modal_norm(m, alpha);
             if norm <= 0.0 {
@@ -777,10 +888,10 @@ impl RfDrums {
                 let swept = volume_displacement(m, alpha).abs();
                 let base = amp * (0.6 + 0.45 * swept);
                 let n_index = index - (m as usize) * membrane::RADIAL_ORDERS;
-                voice.install(index, base * w_lower, f_lower, decay, self.sample_rate);
+                voice.install_driven(index, base * w_lower, f_lower, decay, self.sample_rate);
                 let upper_t60 = t60 * 0.7;
                 let upper_decay = decay_per_sample(upper_t60, self.sample_rate);
-                voice.install(
+                voice.install_driven(
                     MODE_COUNT + n_index,
                     base * w_upper,
                     f_upper,
@@ -796,10 +907,19 @@ impl RfDrums {
                 let split = frequency
                     * PAIR_SPLIT
                     * (0.4 + 1.2 * hash01((note as u32) << 8 | index as u32));
-                voice.install(index, amp * 0.6, frequency, decay, self.sample_rate);
-                voice.install(
+                let (angular_sin, angular_cos) = sincosf(m as f32 * strike_angle);
+                // 0.72 keeps the pair's total energy close to the old
+                // voicing while replacing its unphysical fixed 60/50 split.
+                voice.install_driven(
+                    index,
+                    amp * 0.72 * angular_cos,
+                    frequency,
+                    decay,
+                    self.sample_rate,
+                );
+                voice.install_driven(
                     PAIR_BASE + (index - membrane::RADIAL_ORDERS),
-                    amp * 0.5,
+                    amp * 0.72 * angular_sin,
                     frequency + split,
                     decay,
                     self.sample_rate,
@@ -811,9 +931,17 @@ impl RfDrums {
                 // (1,1)s at their detuning is the sung centre of a tom's
                 // sustain. Coupling weight is a stated placeholder until
                 // the shell drive is continuous.
+                let radial_order = index % membrane::RADIAL_ORDERS;
+                let transfer = 0.28
+                    / (1.0 + 0.12 * m as f32 + 0.10 * radial_order as f32);
+                let polarity = if hash01(0x51ed_270b ^ ((drum as u32) << 8) ^ index as u32) < 0.5 {
+                    -1.0
+                } else {
+                    1.0
+                };
                 voice.install(
                     RES_BASE + (index - membrane::RADIAL_ORDERS),
-                    amp * 0.35,
+                    amp * transfer * polarity,
                     frequency * spec.res_tune,
                     decay_per_sample(t60 * 1.6, self.sample_rate),
                     self.sample_rate,
@@ -903,11 +1031,13 @@ impl RfDrums {
 
     /// The control step: tension relaxation, then the cull.
     fn cull(&mut self) {
-        let glide_keep = expf(-(CULL_INTERVAL as f32) / (GLIDE_TAU_S * self.sample_rate));
         for voice in self.voices.iter_mut() {
             if !voice.active {
                 continue;
             }
+            let glide_keep = expf(
+                -(CULL_INTERVAL as f32) / (voice.glide_tau_s * self.sample_rate),
+            );
             voice.relax(glide_keep);
             voice.age = voice.age.saturating_add(1);
             let mut live = false;
@@ -1018,6 +1148,7 @@ impl Processor for RfDrums {
         self.direct_left = [0.0; DIRECT_BUFFER];
         self.direct_right = [0.0; DIRECT_BUFFER];
         self.direct_pos = 0;
+        self.strike_counter = 0;
         self.room_dirty = true;
     }
 
@@ -1065,8 +1196,12 @@ impl Processor for RfDrums {
                 if !voice.active {
                     continue;
                 }
+                let contact_force = voice.contact_tick();
                 let mut sum = 0.0f32;
-                for mode in voice.modes.iter_mut() {
+                for (index, mode) in voice.modes.iter_mut().enumerate() {
+                    if contact_force != 0.0 {
+                        mode.c += voice.drive[index] * contact_force;
+                    }
                     sum += mode.tick();
                 }
                 sum += voice.wire_tick(sum);
@@ -1429,6 +1564,79 @@ mod tests {
         );
     }
 
+    /// The stick contact must contribute a genuinely broadband edge, not a
+    /// second low drum thump. This compares the same head with only the
+    /// contact-noise path removed, over the first 12 ms.
+    #[test]
+    fn the_stick_contact_has_a_broadband_edge() {
+        let base = SPEC_PARAM_BASE + 2 * SPEC_PARAM_STRIDE; // floor tom
+        let render_with_crack = |crack: f64| {
+            let mut drums = RfDrums::default();
+            assert!(drums.prepare(48_000.0, 512, 0, 2));
+            assert!(drums.set_parameter(PARAM_ROOM_MIX, 0.0));
+            assert!(drums.set_parameter(base + FIELD_CRACK, crack));
+            render(&mut drums, 576, &strike(41, 115))
+        };
+        let with_stick = render_with_crack(1.0);
+        let head_only = render_with_crack(0.0);
+        let stick_high = band_energy(&with_stick, 48_000.0, 1_000.0, 8_000.0);
+        let head_high = band_energy(&head_only, 48_000.0, 1_000.0, 8_000.0);
+        assert!(
+            stick_high > head_high * 3.0,
+            "stick has no broadband edge: with {stick_high}, head only {head_high}"
+        );
+    }
+
+    /// Consecutive hits move around the head by a tiny amount, changing
+    /// modal amplitudes, while the physical modal frequencies stay fixed.
+    #[test]
+    fn repeated_hits_vary_projection_not_tuning() {
+        let mut drums = RfDrums::default();
+        assert!(drums.prepare(48_000.0, 512, 0, 2));
+        drums.strike(41, 100);
+        drums.strike(41, 100);
+        let first = &drums.voices[0];
+        let second = &drums.voices[1];
+        let different_amplitudes = first
+            .modes
+            .iter()
+            .zip(second.modes.iter())
+            .filter(|(a, b)| (a.c - b.c).abs() > 1.0e-5)
+            .count();
+        assert!(different_amplitudes > 10, "successive hits are identical");
+        for (a, b) in first.omega.iter().zip(second.omega.iter()) {
+            assert!((a - b).abs() < 1.0e-7, "strike variation detuned the drum");
+        }
+    }
+
+    /// A stick delivers a normalized force over several samples. Softer
+    /// strokes stay in contact longer, and the modal bank begins at rest
+    /// instead of being filled instantaneously.
+    #[test]
+    fn stick_force_has_finite_velocity_dependent_contact() {
+        let mut hard = RfDrums::default();
+        assert!(hard.prepare(48_000.0, 512, 0, 2));
+        hard.strike(41, 120);
+        let hard_frames = hard.voices[0].contact_frames;
+        assert!(hard_frames >= 2);
+        assert!(hard.voices[0].drive.iter().any(|amp| amp.abs() > 1.0e-4));
+        assert!(hard.voices[0].modes[..SHELL_BASE]
+            .iter()
+            .all(|mode| mode.c == 0.0 && mode.s == 0.0));
+
+        let mut soft = RfDrums::default();
+        assert!(soft.prepare(48_000.0, 512, 0, 2));
+        soft.strike(41, 30);
+        assert!(soft.voices[0].contact_frames > hard_frames);
+
+        let voice = &mut hard.voices[0];
+        let mut impulse = 0.0;
+        for _ in 0..voice.contact_frames {
+            impulse += voice.contact_tick();
+        }
+        assert!((impulse - 1.0).abs() < 1.0e-4, "contact impulse {impulse}");
+    }
+
     /// The struck head starts sharp and settles: tension-modulation glide.
     /// State-level check — the render-level pitch trace belongs to the
     /// calibration tooling.
@@ -1620,7 +1828,7 @@ mod tests {
         for (name, note, velocity, seconds) in [
             ("kick", 36u8, 115u8, 2.0f32),
             ("kick-soft", 36, 50, 2.0),
-            ("snare-nowires", 38, 110, 2.0),
+            ("snare", 38, 110, 2.0),
             ("floor-tom", 41, 110, 4.0),
             ("floor-tom-soft", 41, 45, 4.0),
             ("low-tom", 45, 110, 3.0),

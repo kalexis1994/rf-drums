@@ -83,17 +83,21 @@ the frequencies, not in a feedback path that could gain energy.
 ### Touch reaches timbre through the contact (tested)
 
 A soft blow lets the stick dwell; a hard one shortens the contact and
-brightens the tone — the same road the piano's felt drives. Rendered as a
-second-order low-pass over modal amplitudes at the contact time's reciprocal,
-velocity swinging the contact. `a_hard_blow_is_brighter_than_a_soft_one`
-holds the end-to-end claim on the rendered audio.
+brightens the tone — the same road the piano's felt drives. The spectral
+projection retains its second-order contact low-pass, but excitation is no
+longer an instantaneous modal seed: a unit-area raised-sine force is
+integrated into every struck mode over the effective contact, allowing each
+mode to rotate while the tip still pushes the head. Tip hardening narrows the
+force peak relative to geometric dwell by `CONTACT_BRIGHTNESS`; this ratio
+remains empirical until measured force traces replace it.
+`a_hard_blow_is_brighter_than_a_soft_one` holds the end-to-end timbre claim,
+and `stick_force_has_finite_velocity_dependent_contact` holds duration,
+normalization and the at-rest initial state.
 
-**Stated simplification:** this is the piano's *pre-0.60* felt filter, not
-its emergent strike. The full nonlinear stick–membrane integration (the
-membrane's `simulate_strike`, with the stick's mass and the head's returning
-wave ending the contact) is planned, and the piano's version is the template
-— including its documented defect list, so the hammer-never-separates trap
-is known before it is stepped in.
+**Stated simplification:** this is still not a free stick with mass, tip
+stiffness and separation decided by the returning membrane. That full
+collision model brings multiple micro-bounces and ends contact dynamically
+rather than from the current calibrated duration law.
 
 ### The crack: the stick's own impact (tested)
 
@@ -103,20 +107,24 @@ A drum hit's first ten milliseconds are mostly broadband noise, the stick
 striking the head as a plate before modal motion establishes, and no
 arrangement of modal amplitudes can stand in for it (the piano's action-noise
 lesson, which percussion pays double: there its absence measured 25–31 dB).
-Rendered as an exponentially dying, one-pole low-passed noise burst per
-strike: bandwidth tied to the same contact time that filters the ladder
-(hard blow → shorter contact → brighter crack), level on the Crack fader.
-`the_attack_cracks_and_the_sustain_rings` holds attack-vs-sustain noisiness
-on the rendered audio.
+Rendered as an exponentially dying band-pass noise burst per strike: one
+pole removes ultrasonic grit and a second removes the low body already
+carried by the membrane. Bandwidth is tied to the same contact time that
+filters the ladder (hard blow → shorter contact → brighter crack), level on
+the Crack fader. `the_attack_cracks_and_the_sustain_rings` holds
+attack-vs-sustain noisiness; `the_stick_contact_has_a_broadband_edge` checks
+that the contact adds at least 3× the 1–8 kHz energy of the head alone.
 
 ### Tension-modulation glide (tested)
 
 A struck membrane is stretched by its own displacement: every mode starts
 sharp and settles as the amplitude dies — Kirchhoff–Carrier, far larger on a
 drumhead than on the piano's strings because the head moves millimetres. The
-glide follows velocity² (an amplitude effect, absent pianissimo), reaches
-~+1 semitone fortissimo and relaxes over ~50 ms at control rate by rebuilding
-each rotation from its stored rest frequency — exactly norm-preserving, so
+glide follows velocity² (an amplitude effect, absent pianissimo). Amount and
+relaxation are properties of each body: the tight snare carries 2.5% over
+35 ms, while the kick and loose toms reach 5.5–10% over 70–110 ms. The
+control step rebuilds each rotation from its stored rest frequency — exactly
+norm-preserving, so
 the piano's glide bug (decay factors scaled by √(1+step²) until A0 diverged)
 cannot occur by construction. The 808 *fakes* this curve with a pitch
 envelope; a model with neither the glide nor the crack reads as the 808.
@@ -127,9 +135,14 @@ Every `cos(mθ)` mode has a `sin(mθ)` twin at the same ideal frequency; real
 heads split each pair a few cents through non-uniform hoop tension, and the
 slow beat between twins is what makes a drum partial breathe instead of
 holding a synthesizer's dead-straight sine (Rossing on near-degenerate pairs
-in real drums). Both twins speak on every off-centre strike, split ~0.4% with
-per-(drum, mode) jitter — uniform splitting would beat every partial at a
-rate proportional to frequency, the piano's documented "shimmer" defect.
+in real drums). A strike now projects into the twins as cos(mθ) and sin(mθ),
+so their total energy is conserved and their share follows the real bearing
+of the stick instead of a fixed synthesizer mix. Radius and bearing vary by
+a few percent between hits while modal frequencies remain fixed; the split
+is ~0.4% with per-(drum, mode) jitter — uniform splitting would beat every
+partial at a rate proportional to frequency, the piano's documented
+"shimmer" defect. `repeated_hits_vary_projection_not_tuning` holds that
+boundary.
 
 ### The shell (tested, stated simplification)
 
@@ -225,7 +238,7 @@ Modal synthesis, the Concert Grand's engine: each mode is a damped quadrature
 oscillator — a 2×2 rotation pre-scaled by the per-sample decay — four
 multiplies and two adds per sample, no envelopes, no transcendentals in the
 audio loop. Spent modes retire at block boundaries (the piano's cull).
-A voice is at most 50 oscillators; eight voices of kit are a fraction of what
+A voice is at most 135 oscillators; eight voices of kit are a fraction of what
 a single pedalled piano chord costs, which is the headroom the cymbal phase
 will spend. `a_roll_across_the_kit_survives` is the stress guard: 200 blocks
 of dense rolling with no NaN, no clip, no trap.
@@ -233,7 +246,7 @@ of dense rolling with no NaN, no clip, no trap.
 ## Placeholder voicings, stated as such
 
 `DrumSpec` holds per-drum numbers — pitch, air load, cavity stiffness, T60,
-loss slope, contact time — in plausible physical ranges. **None is a
+loss slope, contact time, glide amount and relaxation — in plausible physical ranges. **None is a
 measurement yet.** The membrane loss curve (`mode_t60`) is one curve with the
 right shape (losses climb with frequency; the drum darkens as it rings) and
 no fitted constants. The radiation weight `1/(1+m/4)` stands in for the
@@ -248,11 +261,11 @@ targets, and the model's claim until then is the mechanisms, not the values.
 * **The kick's beater** — a longer, softer contact plus its own thump, and
   the burial (beater held against the head, killing the sustain — standard
   technique with no equivalent in the model yet).
-* **The emergent strike** — the contact filter is still a drawn law; the
-  stick-membrane integration (stick mass, tip stiffness, contact ended by
-  the head throwing the stick off) brings the multiple micro-bounces of a
-  real stroke with it. The piano's `simulate_strike` is the template,
-  defect list included.
+* **The emergent separation** — finite force integration now ships, but its
+  duration is still a calibrated law. A free stick mass and nonlinear tip,
+  with contact ended by the head throwing the stick off, brings the multiple
+  micro-bounces of a real stroke with it. The piano's `simulate_strike` is
+  the template, defect list included.
 * **Radiation** — head displacement is radiated directly with a toy
   multipole weight; the real efficiency (self-cancelling m ≥ 1 multipoles,
   the near-piston (0,1), front/back head cancellation) is what shaped the
