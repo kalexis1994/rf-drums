@@ -149,6 +149,31 @@ lesson: a strict reciprocal reading "comes out far darker than measured,
 because the felt hardens during contact". A stick tip on Mylar hardens more.
 `CONTACT_BRIGHTNESS = 8` is empirical and stated as such until targets exist.
 
+### The wires (tested, collective form stated)
+
+The snare's defining nonlinearity, in its first honest form. Twenty steel
+wires lie against the resonant head; while the head moves hard they are
+thrown off and re-strike many times per period — a *self-gating* noise
+source that follows the head's motion. The model renders the collective
+reading (per-wire collision, Avanzini & Serafin's family, is the full
+version): an asymmetric envelope follower over the voice's motion (fast
+rise, ~60 ms fall — the sizzle hangs behind the hit), a quadratic soft-knee
+gate so a whisper of motion leaves the wires seated, white noise through a
+1.5–7 kHz band under the gate. Omitted and named: the wires re-exciting the
+head's high modes, and the wires' own ring after separation. The test holds
+both halves: wires-on beats strainer-off by 3× in the sustained sizzle band,
+and the sizzle *follows* the motion (early beats late 2×) instead of hissing
+statically. GM 38/40 is finally a snare drum.
+
+### Bending stiffness (tested)
+
+The piano's inharmonicity B in two dimensions: Mylar is a membrane with a
+little plate in it, so each mode rises by `√(1 + B·(α/α₁₁)²)` over the ideal
+position — negligible at the pitch reference, ~+9% at the top of the carried
+ladder. Without it the whole upper ladder sits systematically flat of a real
+head. One constant for all drums, placeholder magnitude in the plausible
+Mylar range, stated as such.
+
 ### The resonant head, tuned (tested)
 
 The bottom head is no longer just the breathing-mode split. Its coupled pair
@@ -217,11 +242,9 @@ targets, and the model's claim until then is the mechanisms, not the values.
 
 ## Not yet modelled, and named so the absence is a plan
 
-* **The snare's wires** — the defining nonlinearity of the instrument: ~20
-  wires leaving and re-striking the resonant head, a collision problem with
-  no linear modal answer. GM 38/40 currently sounds the drum with the snares
-  thrown off, and says so. Plan: a collective wire model (mass-spring against
-  the head's velocity, gated per control step), Avanzini/Serafin's family.
+* **Per-wire snare collisions** — the collective wire model shipped; the
+  full version is individual wire collisions re-exciting the head's high
+  modes, plus the wires' own ring after separation.
 * **The kick's beater** — a longer, softer contact plus its own thump, and
   the burial (beater held against the head, killing the sustain — standard
   technique with no equivalent in the model yet).
@@ -234,8 +257,6 @@ targets, and the model's claim until then is the mechanisms, not the values.
   multipole weight; the real efficiency (self-cancelling m ≥ 1 multipoles,
   the near-piston (0,1), front/back head cancellation) is what shaped the
   piano's whole decay in the end, and will shape this one.
-* **Membrane bending stiffness** — Mylar's analogue of the piano's B,
-  sharpening the high ladder.
 * **Kit sympathy** — striking the tom buzzes the snare's wires; the signature
   of standing in front of a real kit, and this model's pedal-halo analogue.
 * **Cymbals** — the two-scale plan settled in design: ~40–60 low plate modes

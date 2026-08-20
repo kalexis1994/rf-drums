@@ -109,7 +109,7 @@
 const SPEC_BASE = 16, SPEC_STRIDE = 16;
 const BODIES = [
   { name: "Kick",    slug: "kick-20",   note: 36, drum: 0 },
-  { name: "Snare*",  slug: "snare-14",  note: 38, drum: 1 },
+  { name: "Snare",   slug: "snare-14",  note: 38, drum: 1 },
   { name: "Floor",   slug: "floor-16",  note: 41, drum: 2 },
   { name: "Tom 13",  slug: "tom-13",    note: 45, drum: 3 },
   { name: "Tom 12",  slug: "tom-12",    note: 48, drum: 4 },
@@ -131,13 +131,14 @@ const FIELDS = [
   { key: "shell",            name: "Shell",    min: 0,      max: 4,     log: false, fmt: v => v.toFixed(2) },
   { key: "res_tune",         name: "Res head", min: 0.7,    max: 1.5,   log: false, fmt: v => "×" + v.toFixed(3) },
   { key: "port",             name: "Port",     min: 0,      max: 2,     log: false, fmt: v => v.toFixed(2) },
+  { key: "wires",            name: "Wires",    min: 0,      max: 4,     log: false, fmt: v => v.toFixed(2) },
 ];
 const SEEDS = [
-  [55, 1.2, 0.9, 0.35, 1.6, 0.008, 0.10, 1.6, 1.2, 0.7, 0.90, 0.8],
-  [180, 0.35, 0.55, 0.5, 1.2, 0.0018, 0.45, 1.0, 1.6, 0.8, 1.35, 0.0],
-  [82, 0.6, 0.5, 1.3, 1.3, 0.0025, 0.4, 1.25, 1.0, 0.7, 0.94, 0.0],
-  [110, 0.5, 0.5, 1.0, 1.3, 0.002, 0.4, 1.15, 1.0, 0.7, 0.95, 0.0],
-  [140, 0.45, 0.5, 0.8, 1.3, 0.0018, 0.4, 1.1, 1.0, 0.7, 0.95, 0.0],
+  [55, 1.2, 0.9, 0.35, 1.6, 0.008, 0.10, 1.6, 1.2, 0.7, 0.90, 0.8, 0.0],
+  [180, 0.35, 0.55, 0.5, 1.2, 0.0018, 0.45, 1.0, 1.6, 0.8, 1.35, 0.0, 1.2],
+  [82, 0.6, 0.5, 1.3, 1.3, 0.0025, 0.4, 1.25, 1.0, 0.7, 0.94, 0.0, 0.0],
+  [110, 0.5, 0.5, 1.0, 1.3, 0.002, 0.4, 1.15, 1.0, 0.7, 0.95, 0.0, 0.0],
+  [140, 0.45, 0.5, 0.8, 1.3, 0.0018, 0.4, 1.1, 1.0, 0.7, 0.95, 0.0, 0.0],
 ];
 
 const statusEl = document.getElementById("status");

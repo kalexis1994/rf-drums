@@ -82,6 +82,22 @@ const GLIDE_TAU_S: f32 = 0.05;
 /// beat at a rate proportional to frequency, the piano's "shimmer" defect.
 const PAIR_SPLIT: f32 = 0.004;
 
+/// The head's bending stiffness — the piano's inharmonicity B, in two
+/// dimensions. Mylar is a membrane with a little plate in it: bending adds
+/// a restoring force growing with the wavenumber squared, so each mode is
+/// raised by √(1 + B·(α/α₁₁)²) over the ideal-membrane position — a few
+/// cents in the middle of the table, ~+9% for the highest mode carried.
+/// Without it the whole upper ladder sits systematically flat of a real
+/// head. One number for all drums (film thickness varies less than head
+/// diameter); placeholder magnitude in the plausible Mylar range, stated
+/// as such until measured targets pin it.
+const HEAD_BENDING_B: f32 = 0.004;
+
+/// A mode's stiffness sharpening at `ratio` = α/α₁₁.
+fn bending_sharpen(ratio: f32) -> f32 {
+    sqrtf(1.0 + HEAD_BENDING_B * ratio * ratio)
+}
+
 /// A struck mode below this magnitude² is spent; retired at block edges,
 /// exactly the Concert Grand's cull.
 const DEAD_MAGNITUDE_SQUARED: f32 = 1e-9;
@@ -146,7 +162,7 @@ const DIRECT_BUFFER: usize = 64;
 // will not list these; they are the calibration surface, not the panel.
 pub const SPEC_PARAM_BASE: u32 = 16;
 pub const SPEC_PARAM_STRIDE: u32 = 16;
-pub const SPEC_FIELDS: u32 = 12;
+pub const SPEC_FIELDS: u32 = 13;
 const FIELD_PITCH_HZ: u32 = 0;
 const FIELD_AIR_LOAD: u32 = 1;
 const FIELD_CAVITY: u32 = 2;
@@ -159,6 +175,7 @@ const FIELD_CRACK: u32 = 8;
 const FIELD_SHELL: u32 = 9;
 const FIELD_RES_TUNE: u32 = 10;
 const FIELD_PORT: u32 = 11;
+const FIELD_WIRES: u32 = 12;
 
 /// One damped quadrature oscillator — the Concert Grand's `Component`,
 /// unchanged: rotation matrix pre-scaled by the per-sample decay, four
@@ -257,6 +274,9 @@ struct DrumSpec {
     /// kick's "whoomp". Zero on unported drums. A port also relieves the
     /// cavity spring (an open cavity squeezes less).
     port: f32,
+    /// The snare wires' level. Zero everywhere but the snare; the model is
+    /// collective (see `Voice::wire_tick`), not per-wire.
+    wires: f32,
 }
 
 /// The drums the kit voices, in spec-table order.
@@ -294,6 +314,7 @@ fn default_specs() -> [DrumSpec; DRUM_COUNT] {
             shell: 0.7,
             res_tune: 0.90,
             port: 0.8,
+            wires: 0.0,
         },
         // Snare 14" — WIRES NOT YET MODELLED; this is the drum with the
         // snares thrown off, and the ledger says so.
@@ -310,6 +331,7 @@ fn default_specs() -> [DrumSpec; DRUM_COUNT] {
             shell: 0.8,
             res_tune: 1.35,
             port: 0.0,
+            wires: 1.2,
         },
         // Floor tom 16"
         DrumSpec {
@@ -325,6 +347,7 @@ fn default_specs() -> [DrumSpec; DRUM_COUNT] {
             shell: 0.7,
             res_tune: 0.94,
             port: 0.0,
+            wires: 0.0,
         },
         // Low tom 13"
         DrumSpec {
@@ -340,6 +363,7 @@ fn default_specs() -> [DrumSpec; DRUM_COUNT] {
             shell: 0.7,
             res_tune: 0.95,
             port: 0.0,
+            wires: 0.0,
         },
         // High tom 12"
         DrumSpec {
@@ -355,6 +379,7 @@ fn default_specs() -> [DrumSpec; DRUM_COUNT] {
             shell: 0.7,
             res_tune: 0.95,
             port: 0.0,
+            wires: 0.0,
         },
     ]
 }
@@ -374,6 +399,7 @@ impl DrumSpec {
             FIELD_SHELL => self.shell as f64,
             FIELD_RES_TUNE => self.res_tune as f64,
             FIELD_PORT => self.port as f64,
+            FIELD_WIRES => self.wires as f64,
             _ => return None,
         })
     }
@@ -394,6 +420,7 @@ impl DrumSpec {
             FIELD_SHELL => self.shell = value.clamp(0.0, 8.0),
             FIELD_RES_TUNE => self.res_tune = value.clamp(0.6, 1.6),
             FIELD_PORT => self.port = value.clamp(0.0, 4.0),
+            FIELD_WIRES => self.wires = value.clamp(0.0, 8.0),
             _ => return false,
         }
         true
@@ -419,6 +446,13 @@ struct Voice {
     crack_lp: f32,
     crack_state: f32,
     rng: u32,
+    /// The wires, collectively: gate level fixed at strike, an asymmetric
+    /// envelope follower over the head's motion, and a band-pass state pair
+    /// for the sizzle's colour.
+    wires_level: f32,
+    wire_env: f32,
+    wire_lp: f32,
+    wire_band: f32,
     /// The pair's view of this drum: equal-power gains and integer arrival
     /// delays per side, fixed at note-on from the kit geometry.
     pan_left: f32,
@@ -442,6 +476,10 @@ impl Default for Voice {
             crack_lp: 0.0,
             crack_state: 0.0,
             rng: 1,
+            wires_level: 0.0,
+            wire_env: 0.0,
+            wire_lp: 0.0,
+            wire_band: 0.0,
             pan_left: core::f32::consts::FRAC_1_SQRT_2,
             pan_right: core::f32::consts::FRAC_1_SQRT_2,
             delay_left: 0,
@@ -481,6 +519,48 @@ impl Voice {
             self.modes[index].rc = self.decay[index] * cos;
             self.modes[index].rs = self.decay[index] * sin;
         }
+    }
+
+    /// The wires, collectively — the snare's defining nonlinearity, in its
+    /// stated first form.
+    ///
+    /// Twenty steel wires lie against the resonant head. While the head
+    /// moves hard they are thrown off and re-strike it many times per
+    /// period — a self-gating noise source whose loudness follows the
+    /// head's motion and whose colour is the wires' own bright band. The
+    /// honest model is per-wire collision (Avanzini & Serafin's family);
+    /// this is the collective reading of it, and the ledger says so: an
+    /// asymmetric envelope follower over the voice's motion (fast to rise,
+    /// ~60 ms to fall — wires settle after the head does), a soft-knee gate
+    /// so a whisper of motion leaves the wires seated, and white noise
+    /// through a 1.5–7 kHz band-pass under that gate. What this omits, and
+    /// will be measured missing: the wires re-exciting the head's high
+    /// modes, and the wires' own ring after separation.
+    ///
+    /// Cost: two LCG draws, two one-pole states, per sample, on one drum.
+    #[inline(always)]
+    fn wire_tick(&mut self, head: f32) -> f32 {
+        if self.wires_level == 0.0 {
+            return 0.0;
+        }
+        let drive = if head < 0.0 { -head } else { head };
+        // Fast attack, slow release: the sizzle hangs behind the hit.
+        let rate = if drive > self.wire_env { 0.4 } else { 0.000_35 };
+        self.wire_env += rate * (drive - self.wire_env);
+        // Soft knee: below the knee the wires stay seated and the gate
+        // closes quadratically, which is what "gated by motion" sounds
+        // like against a linear fader's constant hiss.
+        const KNEE: f32 = 0.004;
+        let gate = self.wire_env * self.wire_env / (self.wire_env + KNEE);
+        if gate < 1.0e-6 {
+            return 0.0;
+        }
+        self.rng = self.rng.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        let white = (self.rng >> 8) as f32 * (1.0 / 8_388_608.0) - 1.0;
+        // Band-pass: one-pole low at ~7 kHz minus one-pole low at ~1.5 kHz.
+        self.wire_lp += 0.65 * (white - self.wire_lp);
+        self.wire_band += 0.18 * (self.wire_lp - self.wire_band);
+        (self.wire_lp - self.wire_band) * gate * self.wires_level
     }
 
     /// The crack's next sample: white noise through a one-pole low-pass,
@@ -607,7 +687,11 @@ impl RfDrums {
         let radius = (spec.strike_radius + (self.position - 0.5) * 0.9).clamp(0.02, 0.98);
         // Contact time lengthens for soft blows (a stick thrown gently sinks
         // into the head longer), shortening — brightening — with velocity.
-        let contact = spec.contact_s * (1.6 - 0.8 * velocity_01);
+        // The swing is ~3x across the dynamic range (soft ~2.1x the spec
+        // time, hard ~0.7x), the order stick contacts actually span; the
+        // first cut used 1.67x and the velocity-to-timbre road measured
+        // almost flat once the room diluted it.
+        let contact = spec.contact_s * (2.2 - 1.5 * velocity_01);
         // Second-order low-pass over modal amplitudes tied to the contact's
         // reciprocal — same construction as the piano's felt filter, and
         // with the piano's empirical brightness factor (see
@@ -633,6 +717,9 @@ impl RfDrums {
         voice.crack_lp =
             1.0 - expf(-core::f32::consts::TAU * crack_cutoff / self.sample_rate);
         voice.rng = 0x9e37_79b9 ^ ((note as u32) << 8) ^ (velocity as u32);
+        // The wires' gate level; the ×4 sets the fader's centre near the
+        // audible balance and is voicing, not physics.
+        voice.wires_level = spec.wires * 4.0;
 
         // Where the pair hears this drum: equal-power gains from its lateral
         // place, and each side's own arrival time — path length to each
@@ -654,7 +741,9 @@ impl RfDrums {
 
         for (index, &alpha) in BESSEL_ZEROS.iter().enumerate() {
             let m = angular_order(index);
-            let frequency = f11 * air_loaded_ratio(alpha, spec.air_load);
+            let frequency = f11
+                * air_loaded_ratio(alpha, spec.air_load)
+                * bending_sharpen(alpha / membrane::ALPHA_11);
             let shape = strike_shape(m, alpha, radius, 0.0);
             let norm = modal_norm(m, alpha);
             if norm <= 0.0 {
@@ -980,6 +1069,7 @@ impl Processor for RfDrums {
                 for mode in voice.modes.iter_mut() {
                     sum += mode.tick();
                 }
+                sum += voice.wire_tick(sum);
                 sum += voice.crack_tick();
                 let write = self.direct_pos;
                 self.direct_left[(write + voice.delay_left) & (DIRECT_BUFFER - 1)] +=
@@ -1391,6 +1481,53 @@ mod tests {
             .filter(|&index| voice.modes[index].is_live())
             .count();
         assert!(live_shell >= 2, "shell silent: {live_shell} modes");
+    }
+
+    /// The wires must sizzle while the head moves and settle after it: the
+    /// snare with wires holds far more sustained high band than the same
+    /// drum with the strainer thrown off, and the sizzle must FOLLOW the
+    /// motion (more of it early than late) rather than hiss statically.
+    #[test]
+    fn the_wires_sizzle_with_the_head_and_settle_after_it() {
+        let base = SPEC_PARAM_BASE + SPEC_PARAM_STRIDE; // snare, drum 1
+        let render_with_wires = |wires: f64| {
+            let mut drums = RfDrums::default();
+            assert!(drums.prepare(48_000.0, 512, 0, 2));
+            assert!(drums.set_parameter(base + FIELD_WIRES, wires));
+            render(&mut drums, 48_000, &strike(38, 110))
+        };
+        let with_wires = render_with_wires(1.2);
+        let thrown_off = render_with_wires(0.0);
+        let band = |out: &[f32], from: usize, to: usize| {
+            band_energy(&out[2 * from..2 * to], 48_000.0, 2000.0, 7000.0)
+        };
+        // Sustained sizzle: 60-250 ms, past the crack, before the settle.
+        let sizzle = band(&with_wires, 2_880, 12_000);
+        let dry = band(&thrown_off, 2_880, 12_000);
+        assert!(
+            sizzle > dry * 3.0,
+            "wires silent: with {sizzle}, thrown off {dry}"
+        );
+        // And gated by motion: the early sizzle must beat the late tail.
+        let late = band(&with_wires, 28_800, 38_400);
+        assert!(
+            sizzle > late * 2.0,
+            "wires hiss statically: early {sizzle}, late {late}"
+        );
+    }
+
+    /// Bending stiffness must sharpen the ladder upward, monotonically, and
+    /// by the plate-order magnitude — not rewrite the bottom.
+    #[test]
+    fn bending_sharpens_the_top_of_the_ladder() {
+        assert!((bending_sharpen(1.0) - 1.0).abs() < 0.003, "the pitch reference barely moves");
+        let top = membrane::BESSEL_ZEROS[membrane::MODE_COUNT - 1] / membrane::ALPHA_11;
+        let sharpened = bending_sharpen(top);
+        assert!(
+            sharpened > 1.05 && sharpened < 1.2,
+            "top of the ladder off the plate order: {sharpened}"
+        );
+        assert!(bending_sharpen(3.0) > bending_sharpen(2.0));
     }
 
     /// The resonant head must be audible AS a second tuning: dropping
