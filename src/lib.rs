@@ -17,7 +17,7 @@
 mod math;
 pub mod membrane;
 
-use math::{expf, powf, sincosf};
+use math::{expf, powf, sincosf, sqrtf};
 use membrane::{
     BESSEL_ZEROS, MODE_COUNT, air_loaded_ratio, angular_order, couple_heads, modal_norm,
     strike_shape, volume_displacement,
@@ -85,8 +85,46 @@ const PARAM_TUNE: u32 = 0;
 const PARAM_DAMP: u32 = 1;
 const PARAM_POSITION: u32 = 2;
 const PARAM_LEVEL: u32 = 3;
+const PARAM_ROOM_MIX: u32 = 4;
+const PARAM_ROOM_SIZE: u32 = 5;
 /// Read by the packaging step when it writes `metadata/parameters.json`.
-pub const PARAM_COUNT: usize = 4;
+pub const PARAM_COUNT: usize = 6;
+
+// ---------------------------------------------------------------------------
+// The room and the pair. The Concert Grand's ledger closed this argument:
+// "a bone-dry direct-injected tone is precisely what an electric piano is" —
+// and a bone-dry, dual-mono drum kit is precisely what a drum machine is.
+// A kit is never heard direct: it is heard in a room, through two ears or
+// two overheads. Both constructions below are the piano's, resized.
+// ---------------------------------------------------------------------------
+
+/// Six-line feedback delay network with a Householder feedback matrix —
+/// mutually non-divisible line ratios for a dense, colourless tail, one-pole
+/// damping in each feedback path so highs die faster than lows. The
+/// Householder matrix is orthogonal, so with per-line gains below one the
+/// loop is unconditionally stable.
+const ROOM_LINES: usize = 6;
+const ROOM_BUFFER: usize = 2048;
+const ROOM_SPREAD: [f32; ROOM_LINES] = [0.62, 0.76, 0.90, 1.09, 1.23, 1.43];
+/// Alternating injection signs decorrelate the lines from the start.
+const ROOM_INJECT: [f32; ROOM_LINES] = [0.35, -0.35, 0.35, -0.35, 0.35, -0.35];
+const SOUND_SPEED: f32 = 343.0;
+
+/// Where each drum sits across the kit, metres from centre, drummer's
+/// perspective (snare left of centre, floor tom well right), and the
+/// overhead pair that hears them: spaced HALF-metre-class, above and ahead.
+/// Each voice reaches each side with its own arrival time — the piano's
+/// per-string arrival taps, one instrument over: Δt = geometry, fixed at
+/// note-on, nothing interpolates. A coincident pair would hear no time
+/// differences, and that is what "sounds like a drum machine pan-pot"
+/// means.
+const DRUM_X_M: [f32; DRUM_COUNT] = [0.0, -0.30, 0.55, -0.10, 0.20];
+const PAIR_SPACING_M: f32 = 0.60;
+const PAIR_DISTANCE_M: f32 = 1.40;
+/// The direct bus: a short stereo ring the voices write into ahead of the
+/// read point, one integer delay per (voice, side). 64 samples covers the
+/// widest geometry at 48 kHz with room to spare.
+const DIRECT_BUFFER: usize = 64;
 
 // The voicing table, exposed for calibration by ear: every `DrumSpec` field
 // of every drum is a parameter, addressed as
@@ -349,6 +387,12 @@ struct Voice {
     crack_lp: f32,
     crack_state: f32,
     rng: u32,
+    /// The pair's view of this drum: equal-power gains and integer arrival
+    /// delays per side, fixed at note-on from the kit geometry.
+    pan_left: f32,
+    pan_right: f32,
+    delay_left: usize,
+    delay_right: usize,
     active: bool,
     note: u8,
     age: u32,
@@ -366,6 +410,10 @@ impl Default for Voice {
             crack_lp: 0.0,
             crack_state: 0.0,
             rng: 1,
+            pan_left: core::f32::consts::FRAC_1_SQRT_2,
+            pan_right: core::f32::consts::FRAC_1_SQRT_2,
+            delay_left: 0,
+            delay_right: 0,
             active: false,
             note: 0,
             age: 0,
@@ -429,6 +477,23 @@ pub struct RfDrums {
     damp: f32,
     position: f32,
     level: f32,
+    room_mix: f32,
+    room_size: f32,
+    // The room: six delay lines, compare-and-wrap counters (the piano's
+    // lesson: an integer division per line per sample was 12% of the
+    // callback), one-pole damping state and a per-line gain from RT60.
+    room: [[f32; ROOM_BUFFER]; ROOM_LINES],
+    room_len: [usize; ROOM_LINES],
+    room_pos: [usize; ROOM_LINES],
+    room_gain: [f32; ROOM_LINES],
+    room_damp_state: [f32; ROOM_LINES],
+    room_damp: f32,
+    room_dirty: bool,
+    // The direct bus: voices write ahead of the read point by their
+    // arrival delay.
+    direct_left: [f32; DIRECT_BUFFER],
+    direct_right: [f32; DIRECT_BUFFER],
+    direct_pos: usize,
 }
 
 impl Default for RfDrums {
@@ -442,6 +507,18 @@ impl Default for RfDrums {
             damp: 0.5,
             position: 0.5,
             level: 0.8,
+            room_mix: 0.3,
+            room_size: 0.35,
+            room: [[0.0; ROOM_BUFFER]; ROOM_LINES],
+            room_len: [ROOM_BUFFER; ROOM_LINES],
+            room_pos: [0; ROOM_LINES],
+            room_gain: [0.0; ROOM_LINES],
+            room_damp_state: [0.0; ROOM_LINES],
+            room_damp: 0.3,
+            room_dirty: true,
+            direct_left: [0.0; DIRECT_BUFFER],
+            direct_right: [0.0; DIRECT_BUFFER],
+            direct_pos: 0,
         }
     }
 }
@@ -524,6 +601,24 @@ impl RfDrums {
         voice.crack_lp =
             1.0 - expf(-core::f32::consts::TAU * crack_cutoff / self.sample_rate);
         voice.rng = 0x9e37_79b9 ^ ((note as u32) << 8) ^ (velocity as u32);
+
+        // Where the pair hears this drum: equal-power gains from its lateral
+        // place, and each side's own arrival time — path length to each
+        // microphone over the speed of sound, the earlier side at zero.
+        let x = DRUM_X_M[drum];
+        let pan = (x / 0.8).clamp(-1.0, 1.0);
+        voice.pan_left = sqrtf(0.5 * (1.0 - pan));
+        voice.pan_right = sqrtf(0.5 * (1.0 + pan));
+        let path = |mic_x: f32| {
+            let dx = x - mic_x;
+            sqrtf(dx * dx + PAIR_DISTANCE_M * PAIR_DISTANCE_M) / SOUND_SPEED
+        };
+        let (t_left, t_right) = (path(-0.5 * PAIR_SPACING_M), path(0.5 * PAIR_SPACING_M));
+        let earlier = if t_left < t_right { t_left } else { t_right };
+        voice.delay_left =
+            (((t_left - earlier) * self.sample_rate) as usize).min(DIRECT_BUFFER - 1);
+        voice.delay_right =
+            (((t_right - earlier) * self.sample_rate) as usize).min(DIRECT_BUFFER - 1);
 
         for (index, &alpha) in BESSEL_ZEROS.iter().enumerate() {
             let m = angular_order(index);
@@ -618,6 +713,38 @@ impl RfDrums {
         }
     }
 
+    /// Derives the room from the size control: line lengths from the mean
+    /// free path of the described volume, per-line gains from a Sabine-order
+    /// RT60, damping so highs die faster — the Concert Grand's chamber,
+    /// sized for a tracking room rather than a hall. Runs off the audio
+    /// path, flagged by `room_dirty`.
+    fn tune_room(&mut self) {
+        self.room_dirty = false;
+        // size 0..1 sweeps a close booth (~15 m³) to a live tracking room
+        // (~250 m³). Mean free path 4V/S for a plausible shoebox of that
+        // volume; base delay = mfp / c.
+        let volume = 15.0 + 235.0 * self.room_size * self.room_size;
+        // Shoebox with 2.5:2:1 proportions: V = 5·k³ → surfaces from k.
+        let k = powf(volume / 5.0, 1.0 / 3.0);
+        let surface = 2.0 * (2.5 * k * 2.0 * k + 2.5 * k * k + 2.0 * k * k);
+        let mean_free_path = 4.0 * volume / surface;
+        let base = mean_free_path / SOUND_SPEED * self.sample_rate;
+        // A tracking room's RT60: 0.25 s in the booth to ~1.1 s live.
+        let rt60 = 0.25 + 0.85 * self.room_size;
+        for line in 0..ROOM_LINES {
+            let length = ((base * ROOM_SPREAD[line]) as usize).clamp(31, ROOM_BUFFER - 1);
+            self.room_len[line] = length;
+            self.room_pos[line] = 0;
+            // Gain for -60 dB over RT60 across this line's round trip.
+            self.room_gain[line] =
+                powf(10.0, -3.0 * length as f32 / (rt60 * self.sample_rate));
+            self.room[line] = [0.0; ROOM_BUFFER];
+            self.room_damp_state[line] = 0.0;
+        }
+        // One-pole in each feedback path: highs die roughly twice as fast.
+        self.room_damp = 1.0 - expf(-core::f32::consts::TAU * 4200.0 / self.sample_rate);
+    }
+
     /// The control step: tension relaxation, then the cull.
     fn cull(&mut self) {
         let glide_keep = expf(-(CULL_INTERVAL as f32) / (GLIDE_TAU_S * self.sample_rate));
@@ -659,6 +786,11 @@ impl RfDrums {
             PARAM_DAMP => self.damp = value.clamp(0.0, 1.0),
             PARAM_POSITION => self.position = value.clamp(0.0, 1.0),
             PARAM_LEVEL => self.level = value.clamp(0.0, 1.0),
+            PARAM_ROOM_MIX => self.room_mix = value.clamp(0.0, 1.0),
+            PARAM_ROOM_SIZE => {
+                self.room_size = value.clamp(0.0, 1.0);
+                self.room_dirty = true;
+            }
             _ => return false,
         }
         true
@@ -675,6 +807,8 @@ impl RfDrums {
             PARAM_DAMP => self.damp as f64,
             PARAM_POSITION => self.position as f64,
             PARAM_LEVEL => self.level as f64,
+            PARAM_ROOM_MIX => self.room_mix as f64,
+            PARAM_ROOM_SIZE => self.room_size as f64,
             _ => return None,
         })
     }
@@ -725,6 +859,10 @@ impl Processor for RfDrums {
     fn reset(&mut self) {
         self.voices = [Voice::default(); MAX_VOICES];
         self.since_cull = 0;
+        self.direct_left = [0.0; DIRECT_BUFFER];
+        self.direct_right = [0.0; DIRECT_BUFFER];
+        self.direct_pos = 0;
+        self.room_dirty = true;
     }
 
     fn process(
@@ -738,7 +876,13 @@ impl Processor for RfDrums {
         output_channels: u32,
     ) {
         let channels = output_channels as usize;
+        if self.room_dirty {
+            self.tune_room();
+        }
         let level = self.level * self.level;
+        // Perceived-loudness taper for the mix control; the reverberant
+        // field's power is the square.
+        let room_send = self.room_mix * self.room_mix * 0.8;
         let mut midi_index = 0;
         let mut parameter_index = 0;
         for frame in 0..frames as usize {
@@ -756,19 +900,69 @@ impl Processor for RfDrums {
                 let _ = self.set(event.index, event.value);
                 parameter_index += 1;
             }
-            let mut sum = 0.0f32;
+            // Each voice lands on the pair through its own gains and
+            // arrival delays (writes ahead of the read point); the room is
+            // fed the unpanned sum — the reverberant field has forgotten
+            // where the drum was, which is what "diffuse" means.
+            let mut room_in = 0.0f32;
             for voice in self.voices.iter_mut() {
                 if !voice.active {
                     continue;
                 }
+                let mut sum = 0.0f32;
                 for mode in voice.modes.iter_mut() {
                     sum += mode.tick();
                 }
                 sum += voice.crack_tick();
+                let write = self.direct_pos;
+                self.direct_left[(write + voice.delay_left) & (DIRECT_BUFFER - 1)] +=
+                    sum * voice.pan_left;
+                self.direct_right[(write + voice.delay_right) & (DIRECT_BUFFER - 1)] +=
+                    sum * voice.pan_right;
+                room_in += sum;
             }
-            let sample = soft_clip(sum * level);
-            for channel in 0..channels {
-                output[frame * channels + channel] = sample;
+            let direct_l = self.direct_left[self.direct_pos];
+            let direct_r = self.direct_right[self.direct_pos];
+            self.direct_left[self.direct_pos] = 0.0;
+            self.direct_right[self.direct_pos] = 0.0;
+            self.direct_pos = (self.direct_pos + 1) & (DIRECT_BUFFER - 1);
+
+            // The room: read all six lines, Householder-reflect the sum back
+            // with per-line gain and damping, take the tail off alternating
+            // lines per side — decorrelated left and right by construction.
+            let mut reads = [0.0f32; ROOM_LINES];
+            let mut total = 0.0f32;
+            for line in 0..ROOM_LINES {
+                reads[line] = self.room[line][self.room_pos[line]];
+                total += reads[line];
+            }
+            let householder = total * (2.0 / ROOM_LINES as f32);
+            for line in 0..ROOM_LINES {
+                let feedback = (reads[line] - householder) * self.room_gain[line];
+                self.room_damp_state[line] +=
+                    self.room_damp * (feedback - self.room_damp_state[line]);
+                self.room[line][self.room_pos[line]] =
+                    room_in * room_send * ROOM_INJECT[line] + self.room_damp_state[line];
+                self.room_pos[line] += 1;
+                if self.room_pos[line] >= self.room_len[line] {
+                    self.room_pos[line] = 0;
+                }
+            }
+            let room_l = reads[0] + reads[2] + reads[4];
+            let room_r = reads[1] + reads[3] + reads[5];
+
+            let left = soft_clip((direct_l + room_l) * level);
+            let right = soft_clip((direct_r + room_r) * level);
+            match channels {
+                0 => {}
+                1 => output[frame] = 0.5 * (left + right),
+                _ => {
+                    output[frame * channels] = left;
+                    output[frame * channels + 1] = right;
+                    for channel in 2..channels {
+                        output[frame * channels + channel] = 0.0;
+                    }
+                }
             }
             self.since_cull += 1;
             if self.since_cull >= CULL_INTERVAL {
@@ -970,6 +1164,87 @@ mod tests {
                 "round {round} produced bad samples"
             );
         }
+    }
+
+    fn channel_rms(samples: &[f32], channel: usize) -> f32 {
+        let sum: f64 = samples
+            .chunks(2)
+            .map(|frame| (frame[channel] as f64) * (frame[channel] as f64))
+            .sum();
+        ((sum / (samples.len() / 2) as f64) as f32).sqrt()
+    }
+
+    /// The kit must be a stereo image, not dual mono: the floor tom sits
+    /// right of centre, the snare left, and each drum's two channels must
+    /// actually differ (gains AND arrival times — a pan-pot alone leaves
+    /// identical shapes at different levels; the delay decorrelates them).
+    #[test]
+    fn the_kit_sits_in_a_stereo_image() {
+        let render_drum = |note: u8| {
+            let mut drums = RfDrums::default();
+            assert!(drums.prepare(48_000.0, 512, 0, 2));
+            render(&mut drums, 24_000, &strike(note, 110))
+        };
+        let floor = render_drum(41);
+        assert!(
+            channel_rms(&floor, 1) > channel_rms(&floor, 0) * 1.15,
+            "floor tom not right of centre: L {} R {}",
+            channel_rms(&floor, 0),
+            channel_rms(&floor, 1)
+        );
+        let snare = render_drum(38);
+        assert!(
+            channel_rms(&snare, 0) > channel_rms(&snare, 1) * 1.1,
+            "snare not left of centre: L {} R {}",
+            channel_rms(&snare, 0),
+            channel_rms(&snare, 1)
+        );
+        // And the sides are genuinely different signals, not one signal at
+        // two levels: normalized cross-correlation at lag zero well below 1.
+        let (mut dot, mut left_sq, mut right_sq) = (0.0f64, 0.0f64, 0.0f64);
+        for frame in floor.chunks(2) {
+            dot += frame[0] as f64 * frame[1] as f64;
+            left_sq += (frame[0] as f64).powi(2);
+            right_sq += (frame[1] as f64).powi(2);
+        }
+        let correlation = dot / (left_sq.sqrt() * right_sq.sqrt()).max(1e-30);
+        assert!(
+            correlation < 0.985,
+            "channels are the same signal: correlation {correlation}"
+        );
+    }
+
+    /// The room must leave a tail the dry kit does not have, and the loop
+    /// must be stable: the tail decays instead of ringing on.
+    #[test]
+    fn the_room_leaves_a_decaying_tail() {
+        let render_with_mix = |mix: f64| {
+            let mut drums = RfDrums::default();
+            assert!(drums.prepare(48_000.0, 512, 0, 2));
+            assert!(drums.set_parameter(PARAM_ROOM_MIX, mix));
+            assert!(drums.set_parameter(PARAM_ROOM_SIZE, 0.6));
+            render(&mut drums, 48_000 * 3, &strike(36, 120))
+        };
+        let dry = render_with_mix(0.0);
+        let wet = render_with_mix(0.5);
+        // The kick's own modes are gone within a second; what lives at
+        // 1.2-1.6 s in the wet render is the room.
+        let window = |out: &[f32], from: usize, to: usize| {
+            channel_rms(&out[2 * from..2 * to], 0) + channel_rms(&out[2 * from..2 * to], 1)
+        };
+        let dry_tail = window(&dry, 57_600, 76_800);
+        let wet_tail = window(&wet, 57_600, 76_800);
+        assert!(
+            wet_tail > dry_tail * 3.0 + 1e-9,
+            "room silent: dry tail {dry_tail}, wet tail {wet_tail}"
+        );
+        // Stability: the last quarter second must sit well below the tail.
+        let late = window(&wet, 48_000 * 3 - 12_000, 48_000 * 3);
+        assert!(
+            late < wet_tail * 0.5,
+            "room does not decay: tail {wet_tail}, late {late}"
+        );
+        assert!(wet.iter().all(|x| x.is_finite()));
     }
 
     /// The attack must be NOISY — broadband crack over the modal ladder —

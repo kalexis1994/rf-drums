@@ -149,6 +149,29 @@ lesson: a strict reciprocal reading "comes out far darker than measured,
 because the felt hardens during contact". A stick tip on Mylar hardens more.
 `CONTACT_BRIGHTNESS = 8` is empirical and stated as such until targets exist.
 
+### The pair and the room (tested)
+
+The Concert Grand's ledger closed this argument for every modelled
+instrument: "a bone-dry direct-injected tone is precisely what an electric
+piano is" — and a bone-dry dual-mono kit is precisely what a drum machine
+is. Both constructions are the piano's, resized:
+
+* **The pair.** Each drum sits at its place across the kit (kick centre,
+  snare left, floor tom well right — drummer's perspective) and reaches a
+  spaced overhead pair through equal-power gains AND its own arrival time
+  per side, Δt from the geometry, fixed at note-on. A coincident pan-pot
+  leaves the same signal at two levels; the delay is what decorrelates the
+  channels, and the test measures exactly that (cross-correlation < 0.985).
+* **The room.** Six-line FDN, Householder feedback (orthogonal, so the loop
+  is unconditionally stable with per-line gains below one), mutually
+  non-divisible line ratios, one-pole damping per path so highs die first.
+  Line lengths follow the mean free path 4V/S of the described volume and
+  gains follow a Sabine-order RT60 — a tracking booth (~15 m³, 0.25 s) to a
+  live room (~250 m³, 1.1 s) on one Size control. The reverberant field is
+  fed the unpanned sum: a diffuse field has forgotten where the drum was.
+  Compare-and-wrap counters, not modulo — the piano measured that division
+  at 12% of its callback.
+
 ### Rendering (tested)
 
 Modal synthesis, the Concert Grand's engine: each mode is a damped quadrature
@@ -177,9 +200,31 @@ targets, and the model's claim until then is the mechanisms, not the values.
   no linear modal answer. GM 38/40 currently sounds the drum with the snares
   thrown off, and says so. Plan: a collective wire model (mass-spring against
   the head's velocity, gated per control step), Avanzini/Serafin's family.
-* **The kick's beater and pitch drop** — tension modulation is the piano's
-  Kirchhoff–Carrier glide with the membrane's `Σk²q²` weighting; the beater
-  a longer, softer contact plus its own thump.
+* **The resonant head as a full membrane** — today the bottom head exists
+  only as the breathing-mode split. The real one carries its own complete
+  mode set and its own tuning, and the *detuning between heads* is THE
+  character control of a tom: equal heads sing, a lower resonant head gives
+  the falling "doooom", a higher one dries the note — it is what a drummer
+  tunes with the key.
+* **The kick's port (Helmholtz)** — the modern kick's "whoomp" is largely
+  the port's Helmholtz resonance; the cavity currently has a stiffness
+  constant, no resonator and no vent. One more oscillator, cheap.
+* **The kick's beater** — a longer, softer contact plus its own thump, and
+  the burial (beater held against the head, killing the sustain — standard
+  technique with no equivalent in the model yet).
+* **The emergent strike** — the contact filter is still a drawn law; the
+  stick-membrane integration (stick mass, tip stiffness, contact ended by
+  the head throwing the stick off) brings the multiple micro-bounces of a
+  real stroke with it. The piano's `simulate_strike` is the template,
+  defect list included.
+* **Radiation** — head displacement is radiated directly with a toy
+  multipole weight; the real efficiency (self-cancelling m ≥ 1 multipoles,
+  the near-piston (0,1), front/back head cancellation) is what shaped the
+  piano's whole decay in the end, and will shape this one.
+* **Membrane bending stiffness** — Mylar's analogue of the piano's B,
+  sharpening the high ladder.
+* **Kit sympathy** — striking the tom buzzes the snare's wires; the signature
+  of standing in front of a real kit, and this model's pedal-halo analogue.
 * **Cymbals** — the two-scale plan settled in design: ~40–60 low plate modes
   individualised (the crash's gong, the ride's ping, the bell), a statistical
   high-frequency cloud (small undamped FDN, the piano's open-register
@@ -188,12 +233,10 @@ targets, and the model's claim until then is the mechanisms, not the values.
   *measured* from recordings per zone and velocity rather than drawn.
   Baked offline: per-zone excitation vectors and the pruned internal-resonance
   coupling list. (Touzé, Thomas & Chaigne on nonlinear plate vibration.)
-* **The shell, the hoop, the sticks' own knock** — the piano's action-noise
-  lesson says the mechanism sounds will be measured missing before they are
-  added; they wait for targets.
-* **The room** — the Concert Grand's derived recording chain (Sabine FDN,
-  mic pair geometry) is host-proven and will be carried over rather than
-  re-invented.
+* **The hoop, the lugs, the continuous shell drive** — the rimshot and the
+  rim click, hardware rattle under a hard blow, and the shell driven through
+  the bearing edge for the note's whole life rather than seeded at the
+  strike; they wait for measured targets.
 
 ## Calibration plan
 
