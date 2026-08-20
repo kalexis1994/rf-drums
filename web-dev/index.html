@@ -1,0 +1,244 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>RF-Drums dev</title>
+<style>
+  :root {
+    --bg: #0b0f12; --panel: #141b21; --edge: #22303a;
+    --text: #d7e3ea; --dim: #6b7f8c; --accent: #f3bc7c; --hot: #e06c50;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 14px/1.45 system-ui, sans-serif;
+    min-height: 100vh; display: flex; flex-direction: column; gap: 12px;
+    padding: 12px; touch-action: manipulation;
+  }
+  header { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+  h1 { font-size: 18px; color: var(--accent); font-weight: 600; }
+  #status { color: var(--dim); font-size: 12px; }
+  #status.err { color: var(--hot); }
+  button {
+    background: var(--panel); color: var(--text); border: 1px solid var(--edge);
+    border-radius: 8px; padding: 8px 14px; font-size: 14px; cursor: pointer;
+  }
+  button:active { background: var(--edge); }
+  #start { background: var(--accent); color: #14100a; font-weight: 700; border: 0; }
+
+  #pads {
+    display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px;
+    flex: 1; min-height: 220px;
+  }
+  .pad {
+    position: relative; border-radius: 12px; border: 1px solid var(--edge);
+    background: linear-gradient(180deg, #1a232b, #101820);
+    display: flex; flex-direction: column; justify-content: flex-end;
+    align-items: center; padding-bottom: 10px; user-select: none;
+    overflow: hidden; touch-action: none;
+  }
+  .pad .name { font-weight: 600; pointer-events: none; }
+  .pad .hint { color: var(--dim); font-size: 11px; pointer-events: none; }
+  .pad .zone {
+    position: absolute; top: 6px; left: 0; right: 0; text-align: center;
+    color: var(--dim); font-size: 10px; pointer-events: none;
+  }
+  .pad.hit { border-color: var(--accent); }
+  .pad .flash {
+    position: absolute; inset: 0; background: var(--accent);
+    opacity: 0; pointer-events: none; transition: opacity 240ms ease-out;
+  }
+  .pad.hit .flash { opacity: 0.28; transition: none; }
+
+  #controls {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 10px; background: var(--panel); border: 1px solid var(--edge);
+    border-radius: 12px; padding: 12px;
+  }
+  .control label { display: flex; justify-content: space-between; color: var(--dim); font-size: 12px; }
+  .control label b { color: var(--text); font-weight: 500; }
+  input[type=range] { width: 100%; accent-color: var(--accent); }
+
+  #scope-wrap { background: var(--panel); border: 1px solid var(--edge); border-radius: 12px; padding: 8px; }
+  canvas { width: 100%; height: 110px; display: block; }
+  footer { color: var(--dim); font-size: 11px; }
+  footer code { color: var(--text); }
+</style>
+</head>
+<body>
+<header>
+  <h1>RF-Drums</h1>
+  <span id="status">motor detenido</span>
+  <span style="flex:1"></span>
+  <button id="rebuild" title="cargo build en el server y recarga">⟳ rebuild</button>
+  <button id="start">▶ arrancar audio</button>
+</header>
+
+<div id="pads"></div>
+
+<div id="controls"></div>
+
+<div id="scope-wrap"><canvas id="scope"></canvas></div>
+
+<footer>
+  La altura del toque en el pad fija la <b>velocity</b> (arriba = fuerte); teclas
+  <code>Z X C V B</code>. Los sliders van por la ABI real
+  (<code>rackforge_set_parameter</code>); el audio sale del mismo
+  <code>rf_drums.wasm</code> que carga RackForge.
+</footer>
+
+<script>
+const PADS = [
+  { name: "Kick",      note: 36, key: "z" },
+  { name: "Snare*",    note: 38, key: "x", hint: "*sin bordonera aún" },
+  { name: "Floor 16",  note: 41, key: "c" },
+  { name: "Tom 13",    note: 45, key: "v" },
+  { name: "Tom 12",    note: 48, key: "b" },
+];
+const PARAMS = [
+  { name: "Tune",     index: 0, value: 0.5, detail: "±5 st" },
+  { name: "Damp",     index: 1, value: 0.5, detail: "±½ década T60" },
+  { name: "Position", index: 2, value: 0.5, detail: "centro → aro" },
+  { name: "Level",    index: 3, value: 0.8, detail: "" },
+];
+
+const statusEl = document.getElementById("status");
+let node = null, analyser = null, context = null;
+
+function setStatus(text, err = false) {
+  statusEl.textContent = text;
+  statusEl.className = err ? "err" : "";
+}
+
+async function start() {
+  if (context) return;
+  context = new AudioContext({ latencyHint: "interactive" });
+  const wasmBytes = await (await fetch("rf_drums.wasm", { cache: "no-store" })).arrayBuffer();
+  await context.audioWorklet.addModule("worklet.js");
+  node = new AudioWorkletNode(context, "rf-drums", {
+    numberOfInputs: 0,
+    outputChannelCount: [2],
+    processorOptions: { wasmBytes },
+  });
+  analyser = context.createAnalyser();
+  analyser.fftSize = 2048;
+  node.connect(analyser);
+  analyser.connect(context.destination);
+  for (const p of PARAMS) {
+    node.port.postMessage({ type: "param", index: p.index, value: p.value });
+  }
+  await context.resume();
+  setStatus(`sonando · ${context.sampleRate} Hz · latencia base ${Math.round(context.baseLatency * 1000)} ms`);
+  document.getElementById("start").style.display = "none";
+  drawScope();
+}
+
+function hit(note, velocity) {
+  if (!node) return;
+  node.port.postMessage({ type: "midi", data: [0x99, note, Math.max(1, Math.min(127, velocity | 0))] });
+}
+
+// --- pads: touch height = velocity ---
+const padsEl = document.getElementById("pads");
+for (const pad of PADS) {
+  const el = document.createElement("div");
+  el.className = "pad";
+  el.innerHTML = `<div class="flash"></div><div class="zone"></div>
+    <div class="name">${pad.name}</div>
+    <div class="hint">${pad.hint ?? ""} [${pad.key.toUpperCase()}]</div>`;
+  const strike = (event) => {
+    event.preventDefault();
+    const rect = el.getBoundingClientRect();
+    const y = (event.clientY - rect.top) / rect.height; // 0 top .. 1 bottom
+    const velocity = 127 * (1 - 0.85 * y);
+    hit(pad.note, velocity);
+    el.querySelector(".zone").textContent = `vel ${velocity | 0}`;
+    el.classList.add("hit");
+    requestAnimationFrame(() => requestAnimationFrame(() => el.classList.remove("hit")));
+  };
+  el.addEventListener("pointerdown", strike);
+  pad.el = el;
+  padsEl.appendChild(el);
+}
+document.addEventListener("keydown", (event) => {
+  if (event.repeat) return;
+  const pad = PADS.find((p) => p.key === event.key.toLowerCase());
+  if (!pad) return;
+  hit(pad.note, 110);
+  pad.el.classList.add("hit");
+  requestAnimationFrame(() => requestAnimationFrame(() => pad.el.classList.remove("hit")));
+});
+
+// --- parameter sliders over the real ABI ---
+const controlsEl = document.getElementById("controls");
+for (const p of PARAMS) {
+  const el = document.createElement("div");
+  el.className = "control";
+  el.innerHTML = `<label><b>${p.name}</b><span>${p.detail}</span></label>
+    <input type="range" min="0" max="1" step="0.001" value="${p.value}">`;
+  el.querySelector("input").addEventListener("input", (event) => {
+    p.value = Number(event.target.value);
+    if (node) node.port.postMessage({ type: "param", index: p.index, value: p.value });
+  });
+  controlsEl.appendChild(el);
+}
+
+// --- oscilloscope + spectrum ---
+const canvas = document.getElementById("scope");
+const draw2d = canvas.getContext("2d");
+function drawScope() {
+  const dpr = devicePixelRatio || 1;
+  const width = canvas.clientWidth * dpr, height = canvas.clientHeight * dpr;
+  if (canvas.width !== width) { canvas.width = width; canvas.height = height; }
+  draw2d.clearRect(0, 0, width, height);
+
+  const wave = new Float32Array(analyser.fftSize);
+  analyser.getFloatTimeDomainData(wave);
+  draw2d.strokeStyle = "#f3bc7c";
+  draw2d.lineWidth = dpr;
+  draw2d.beginPath();
+  for (let i = 0; i < wave.length; i++) {
+    const x = (i / wave.length) * width;
+    const y = height * (0.5 - 0.45 * wave[i]);
+    i === 0 ? draw2d.moveTo(x, y) : draw2d.lineTo(x, y);
+  }
+  draw2d.stroke();
+
+  const spectrum = new Uint8Array(analyser.frequencyBinCount);
+  analyser.getByteFrequencyData(spectrum);
+  draw2d.fillStyle = "rgba(107,127,140,0.55)";
+  const bars = 96;
+  for (let i = 0; i < bars; i++) {
+    // log frequency axis, 30 Hz .. 12 kHz
+    const f0 = 30 * Math.pow(12000 / 30, i / bars);
+    const bin = Math.min(spectrum.length - 1, Math.round((f0 / (context.sampleRate / 2)) * spectrum.length));
+    const level = spectrum[bin] / 255;
+    const barWidth = width / bars;
+    draw2d.fillRect(i * barWidth, height * (1 - 0.95 * level), barWidth * 0.7, height * 0.95 * level);
+  }
+  requestAnimationFrame(drawScope);
+}
+
+// --- rebuild: the server runs cargo, the page reloads the new wasm ---
+document.getElementById("rebuild").addEventListener("click", async () => {
+  setStatus("compilando…");
+  try {
+    const result = await (await fetch("/build", { method: "POST" })).json();
+    if (result.ok) {
+      setStatus("compilado; recargando");
+      location.reload();
+    } else {
+      setStatus("build falló — mirá la consola", true);
+      console.error(result.output);
+    }
+  } catch (error) {
+    setStatus(`build error: ${error}`, true);
+  }
+});
+
+document.getElementById("start").addEventListener("click", () =>
+  start().catch((error) => setStatus(`${error}`, true)));
+</script>
+</body>
+</html>
