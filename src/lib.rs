@@ -49,6 +49,28 @@ const PARAM_LEVEL: u32 = 3;
 /// Read by the packaging step when it writes `metadata/parameters.json`.
 pub const PARAM_COUNT: usize = 4;
 
+// The voicing table, exposed for calibration by ear: every `DrumSpec` field
+// of every drum is a parameter, addressed as
+//
+//     index = SPEC_PARAM_BASE + drum * SPEC_PARAM_STRIDE + field
+//
+// and carrying its PHYSICAL value (hertz, seconds, dimensionless) rather
+// than a normalized one — the dev frontend's faders and the JSON the user
+// copies out of it are voicings a person can read, and what lands back in
+// `default_specs` needs no conversion. The production `parameters.json`
+// will not list these; they are the calibration surface, not the panel.
+pub const SPEC_PARAM_BASE: u32 = 16;
+pub const SPEC_PARAM_STRIDE: u32 = 16;
+pub const SPEC_FIELDS: u32 = 8;
+const FIELD_PITCH_HZ: u32 = 0;
+const FIELD_AIR_LOAD: u32 = 1;
+const FIELD_CAVITY: u32 = 2;
+const FIELD_T60_S: u32 = 3;
+const FIELD_LOSS_SLOPE: u32 = 4;
+const FIELD_CONTACT_S: u32 = 5;
+const FIELD_RADIUS: u32 = 6;
+const FIELD_GAIN: u32 = 7;
+
 /// One damped quadrature oscillator — the Concert Grand's `Component`,
 /// unchanged: rotation matrix pre-scaled by the per-sample decay, four
 /// multiplies and two adds per sample, no envelope, no transcendentals in
@@ -131,12 +153,29 @@ struct DrumSpec {
     gain: f32,
 }
 
-/// General MIDI percussion map, the subset this milestone voices.
-fn spec_for_note(note: u8) -> Option<DrumSpec> {
+/// The drums the kit voices, in spec-table order.
+pub const DRUM_COUNT: usize = 5;
+
+/// General MIDI note → index into the voicing table.
+fn drum_for_note(note: u8) -> Option<usize> {
     Some(match note {
+        35 | 36 => 0, // kick
+        38 | 40 => 1, // snare
+        41 | 43 => 2, // floor tom
+        45 | 47 => 3, // low tom
+        48 | 50 => 4, // high tom
+        _ => return None,
+    })
+}
+
+/// The shipped voicings — the numbers being calibrated by ear through the
+/// dev frontend's spec faders. When a better set comes back as JSON, it
+/// lands HERE, and nowhere else.
+fn default_specs() -> [DrumSpec; DRUM_COUNT] {
+    [
         // Kick 20": both heads heavy, ported, damped — the tone is mostly
         // the breathing pair plus the beater's thump.
-        35 | 36 => DrumSpec {
+        DrumSpec {
             pitch_hz: 55.0,
             air_load: 1.2,
             cavity_stiffness: 0.9,
@@ -148,7 +187,7 @@ fn spec_for_note(note: u8) -> Option<DrumSpec> {
         },
         // Snare 14" — WIRES NOT YET MODELLED; this is the drum with the
         // snares thrown off, and the ledger says so.
-        38 | 40 => DrumSpec {
+        DrumSpec {
             pitch_hz: 180.0,
             air_load: 0.35,
             cavity_stiffness: 0.55,
@@ -159,7 +198,7 @@ fn spec_for_note(note: u8) -> Option<DrumSpec> {
             gain: 1.0,
         },
         // Floor tom 16"
-        41 | 43 => DrumSpec {
+        DrumSpec {
             pitch_hz: 82.0,
             air_load: 0.6,
             cavity_stiffness: 0.5,
@@ -170,7 +209,7 @@ fn spec_for_note(note: u8) -> Option<DrumSpec> {
             gain: 1.25,
         },
         // Low tom 13"
-        45 | 47 => DrumSpec {
+        DrumSpec {
             pitch_hz: 110.0,
             air_load: 0.5,
             cavity_stiffness: 0.5,
@@ -181,7 +220,7 @@ fn spec_for_note(note: u8) -> Option<DrumSpec> {
             gain: 1.15,
         },
         // High tom 12"
-        48 | 50 => DrumSpec {
+        DrumSpec {
             pitch_hz: 140.0,
             air_load: 0.45,
             cavity_stiffness: 0.5,
@@ -191,8 +230,40 @@ fn spec_for_note(note: u8) -> Option<DrumSpec> {
             strike_radius: 0.4,
             gain: 1.1,
         },
-        _ => return None,
-    })
+    ]
+}
+
+impl DrumSpec {
+    fn field(&self, field: u32) -> Option<f64> {
+        Some(match field {
+            FIELD_PITCH_HZ => self.pitch_hz as f64,
+            FIELD_AIR_LOAD => self.air_load as f64,
+            FIELD_CAVITY => self.cavity_stiffness as f64,
+            FIELD_T60_S => self.t60_s as f64,
+            FIELD_LOSS_SLOPE => self.loss_slope as f64,
+            FIELD_CONTACT_S => self.contact_s as f64,
+            FIELD_RADIUS => self.strike_radius as f64,
+            FIELD_GAIN => self.gain as f64,
+            _ => return None,
+        })
+    }
+
+    /// Physical values, clamped to the range where the model stays sane
+    /// rather than to taste — taste is what the faders are for.
+    fn set_field(&mut self, field: u32, value: f32) -> bool {
+        match field {
+            FIELD_PITCH_HZ => self.pitch_hz = value.clamp(20.0, 1000.0),
+            FIELD_AIR_LOAD => self.air_load = value.clamp(0.0, 8.0),
+            FIELD_CAVITY => self.cavity_stiffness = value.clamp(0.0, 4.0),
+            FIELD_T60_S => self.t60_s = value.clamp(0.02, 20.0),
+            FIELD_LOSS_SLOPE => self.loss_slope = value.clamp(1.0, 4.0),
+            FIELD_CONTACT_S => self.contact_s = value.clamp(0.000_2, 0.05),
+            FIELD_RADIUS => self.strike_radius = value.clamp(0.02, 0.98),
+            FIELD_GAIN => self.gain = value.clamp(0.0, 8.0),
+            _ => return false,
+        }
+        true
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -211,6 +282,7 @@ impl Default for Voice {
 
 pub struct RfDrums {
     voices: [Voice; MAX_VOICES],
+    specs: [DrumSpec; DRUM_COUNT],
     sample_rate: f32,
     since_cull: u32,
     // Parameters, all 0..1 with a documented mapping.
@@ -224,6 +296,7 @@ impl Default for RfDrums {
     fn default() -> Self {
         Self {
             voices: [Voice::default(); MAX_VOICES],
+            specs: default_specs(),
             sample_rate: 48_000.0,
             since_cull: 0,
             tune: 0.5,
@@ -249,9 +322,10 @@ impl RfDrums {
     }
 
     fn strike(&mut self, note: u8, velocity: u8) {
-        let Some(spec) = spec_for_note(note) else {
+        let Some(drum) = drum_for_note(note) else {
             return;
         };
+        let spec = self.specs[drum];
         // Steal the oldest voice; a drum voice is short-lived and a kit
         // player retriggers the same drum constantly, so same-note steals
         // its own oldest instance first.
@@ -374,6 +448,14 @@ impl RfDrums {
     }
 
     fn set(&mut self, index: u32, value: f64) -> bool {
+        if index >= SPEC_PARAM_BASE {
+            let drum = ((index - SPEC_PARAM_BASE) / SPEC_PARAM_STRIDE) as usize;
+            let field = (index - SPEC_PARAM_BASE) % SPEC_PARAM_STRIDE;
+            let Some(spec) = self.specs.get_mut(drum) else {
+                return false;
+            };
+            return spec.set_field(field, value as f32);
+        }
         let value = value as f32;
         match index {
             PARAM_TUNE => self.tune = value.clamp(0.0, 1.0),
@@ -386,6 +468,11 @@ impl RfDrums {
     }
 
     fn get(&self, index: u32) -> Option<f64> {
+        if index >= SPEC_PARAM_BASE {
+            let drum = ((index - SPEC_PARAM_BASE) / SPEC_PARAM_STRIDE) as usize;
+            let field = (index - SPEC_PARAM_BASE) % SPEC_PARAM_STRIDE;
+            return self.specs.get(drum)?.field(field);
+        }
         Some(match index {
             PARAM_TUNE => self.tune as f64,
             PARAM_DAMP => self.damp as f64,
@@ -672,6 +759,35 @@ mod tests {
                 "round {round} produced bad samples"
             );
         }
+    }
+
+    /// The spec faders must reach the engine: retuning the floor tom's pitch
+    /// through the parameter surface must move the rendered spectrum, and
+    /// reading it back must return what was written.
+    #[test]
+    fn spec_parameters_reach_the_membrane() {
+        let base = SPEC_PARAM_BASE + 2 * SPEC_PARAM_STRIDE; // floor tom
+        let mut drums = RfDrums::default();
+        assert!(drums.prepare(48_000.0, 512, 0, 2));
+        assert!(drums.set_parameter(base + FIELD_PITCH_HZ, 130.0));
+        assert_eq!(drums.get_parameter(base + FIELD_PITCH_HZ), Some(130.0));
+        let retuned_render = render(&mut drums, 24_000, &strike(41, 110));
+        let mut stock = RfDrums::default();
+        assert!(stock.prepare(48_000.0, 512, 0, 2));
+        let stock_render = render(&mut stock, 24_000, &strike(41, 110));
+        // The (1,1) region of the retuned drum, in both renders: only the
+        // drum whose pitch fader moved may hold it. (Comparing bands within
+        // ONE render confounds — a 130 Hz tom's breathing (0,1) lands right
+        // back in the 82 Hz drum's fundamental band.)
+        let retuned = band_energy(&retuned_render, 48_000.0, 120.0, 142.0);
+        let stock = band_energy(&stock_render, 48_000.0, 120.0, 142.0);
+        assert!(
+            retuned > stock * 3.0,
+            "pitch fader inert: stock 120-142 Hz {stock}, retuned {retuned}"
+        );
+        // Out-of-table drums and unknown fields must refuse, not wrap.
+        assert!(!drums.set_parameter(SPEC_PARAM_BASE + 5 * SPEC_PARAM_STRIDE, 100.0));
+        assert!(!drums.set_parameter(base + SPEC_FIELDS, 1.0));
     }
 
     /// Not a test: renders each drum to a WAV for listening and calibration.

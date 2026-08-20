@@ -10,107 +10,129 @@
     --text: #d7e3ea; --dim: #6b7f8c; --accent: #f3bc7c; --hot: #e06c50;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+  html, body { height: 100%; }
   body {
     background: var(--bg); color: var(--text);
-    font: 14px/1.45 system-ui, sans-serif;
-    min-height: 100vh; display: flex; flex-direction: column; gap: 12px;
-    padding: 12px; touch-action: manipulation;
+    font: 14px/1.4 system-ui, sans-serif;
+    display: flex; flex-direction: column; gap: 10px;
+    padding: 10px; touch-action: manipulation; overflow: hidden;
   }
-  header { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
-  h1 { font-size: 18px; color: var(--accent); font-weight: 600; }
-  #status { color: var(--dim); font-size: 12px; }
+  header { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  h1 { font-size: 16px; color: var(--accent); font-weight: 600; margin-right: 4px; }
+  #status { color: var(--dim); font-size: 11px; flex: 1; min-width: 120px; }
   #status.err { color: var(--hot); }
   button {
     background: var(--panel); color: var(--text); border: 1px solid var(--edge);
-    border-radius: 8px; padding: 8px 14px; font-size: 14px; cursor: pointer;
+    border-radius: 8px; padding: 7px 12px; font-size: 13px; cursor: pointer;
   }
   button:active { background: var(--edge); }
   #start { background: var(--accent); color: #14100a; font-weight: 700; border: 0; }
 
-  #pads {
-    display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px;
-    flex: 1; min-height: 220px;
+  /* selector de cuerpo */
+  #bodies { display: flex; gap: 6px; overflow-x: auto; }
+  .body {
+    flex: 1; min-width: 70px; text-align: center; padding: 9px 4px;
+    border: 1px solid var(--edge); border-radius: 10px; background: var(--panel);
+    color: var(--dim); cursor: pointer; user-select: none; font-size: 13px;
   }
-  .pad {
-    position: relative; border-radius: 12px; border: 1px solid var(--edge);
+  .body.sel { color: #14100a; background: var(--accent); border-color: var(--accent); font-weight: 700; }
+
+  /* pad a la izquierda (~18%), faders a la derecha */
+  #main { flex: 1; display: flex; gap: 10px; min-height: 0; }
+  #pad {
+    flex: 0 0 18%; min-width: 84px; border-radius: 14px;
+    border: 1px solid var(--edge);
     background: linear-gradient(180deg, #1a232b, #101820);
-    display: flex; flex-direction: column; justify-content: flex-end;
-    align-items: center; padding-bottom: 10px; user-select: none;
-    overflow: hidden; touch-action: none;
+    position: relative; user-select: none; touch-action: none; overflow: hidden;
   }
-  .pad .name { font-weight: 600; pointer-events: none; }
-  .pad .hint { color: var(--dim); font-size: 11px; pointer-events: none; }
-  .pad .zone {
-    position: absolute; top: 6px; left: 0; right: 0; text-align: center;
+  #pad .flash { position: absolute; inset: 0; background: var(--accent); opacity: 0; pointer-events: none; transition: opacity 240ms ease-out; }
+  #pad.hit .flash { opacity: 0.3; transition: none; }
+  #pad .tag {
+    position: absolute; left: 0; right: 0; bottom: 10px; text-align: center;
+    color: var(--dim); font-size: 11px; pointer-events: none;
+  }
+  #pad .axis {
+    position: absolute; top: 8px; left: 0; right: 0; text-align: center;
     color: var(--dim); font-size: 10px; pointer-events: none;
   }
-  .pad.hit { border-color: var(--accent); }
-  .pad .flash {
-    position: absolute; inset: 0; background: var(--accent);
-    opacity: 0; pointer-events: none; transition: opacity 240ms ease-out;
-  }
-  .pad.hit .flash { opacity: 0.28; transition: none; }
 
-  #controls {
-    display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-    gap: 10px; background: var(--panel); border: 1px solid var(--edge);
-    border-radius: 12px; padding: 12px;
+  #faders {
+    flex: 1; display: flex; flex-direction: column; gap: 6px;
+    background: var(--panel); border: 1px solid var(--edge); border-radius: 14px;
+    padding: 10px 12px; overflow-y: auto; min-height: 0;
   }
-  .control label { display: flex; justify-content: space-between; color: var(--dim); font-size: 12px; }
-  .control label b { color: var(--text); font-weight: 500; }
-  input[type=range] { width: 100%; accent-color: var(--accent); }
+  .fader { display: grid; grid-template-columns: 86px 1fr 64px; gap: 8px; align-items: center; }
+  .fader .name { color: var(--dim); font-size: 12px; }
+  .fader .value { text-align: right; font-size: 12px; font-variant-numeric: tabular-nums; }
+  input[type=range] { width: 100%; accent-color: var(--accent); height: 26px; }
 
-  #scope-wrap { background: var(--panel); border: 1px solid var(--edge); border-radius: 12px; padding: 8px; }
-  canvas { width: 100%; height: 110px; display: block; }
-  footer { color: var(--dim); font-size: 11px; }
-  footer code { color: var(--text); }
+  #bottom { display: flex; gap: 8px; align-items: center; }
+  #copy { background: var(--accent); color: #14100a; font-weight: 700; border: 0; flex: 0 0 auto; }
+  #json {
+    flex: 1; background: var(--panel); border: 1px solid var(--edge); border-radius: 8px;
+    color: var(--dim); font: 10px/1.35 ui-monospace, monospace; padding: 6px 8px;
+    white-space: nowrap; overflow-x: auto; min-height: 30px;
+  }
 </style>
 </head>
 <body>
 <header>
   <h1>RF-Drums</h1>
   <span id="status">motor detenido</span>
-  <span style="flex:1"></span>
-  <button id="rebuild" title="cargo build en el server y recarga">⟳ rebuild</button>
-  <button id="start">▶ arrancar audio</button>
+  <button id="rebuild">⟳ rebuild</button>
+  <button id="start">▶ audio</button>
 </header>
 
-<div id="pads"></div>
+<div id="bodies"></div>
 
-<div id="controls"></div>
+<div id="main">
+  <div id="pad">
+    <div class="flash"></div>
+    <div class="axis">arriba = fuerte</div>
+    <div class="tag">golpear</div>
+  </div>
+  <div id="faders"></div>
+</div>
 
-<div id="scope-wrap"><canvas id="scope"></canvas></div>
-
-<footer>
-  La altura del toque en el pad fija la <b>velocity</b> (arriba = fuerte); teclas
-  <code>Z X C V B</code>. Los sliders van por la ABI real
-  (<code>rackforge_set_parameter</code>); el audio sale del mismo
-  <code>rf_drums.wasm</code> que carga RackForge.
-</footer>
+<div id="bottom">
+  <button id="copy">⧉ copy parameters</button>
+  <div id="json">el JSON del cuerpo seleccionado aparece acá</div>
+</div>
 
 <script>
-const PADS = [
-  { name: "Kick",      note: 36, key: "z" },
-  { name: "Snare*",    note: 38, key: "x", hint: "*sin bordonera aún" },
-  { name: "Floor 16",  note: 41, key: "c" },
-  { name: "Tom 13",    note: 45, key: "v" },
-  { name: "Tom 12",    note: 48, key: "b" },
+const SPEC_BASE = 16, SPEC_STRIDE = 16;
+const BODIES = [
+  { name: "Kick",    slug: "kick-20",   note: 36, drum: 0 },
+  { name: "Snare*",  slug: "snare-14",  note: 38, drum: 1 },
+  { name: "Floor",   slug: "floor-16",  note: 41, drum: 2 },
+  { name: "Tom 13",  slug: "tom-13",    note: 45, drum: 3 },
+  { name: "Tom 12",  slug: "tom-12",    note: 48, drum: 4 },
 ];
-const PARAMS = [
-  { name: "Tune",     index: 0, value: 0.5, detail: "±5 st" },
-  { name: "Damp",     index: 1, value: 0.5, detail: "±½ década T60" },
-  { name: "Position", index: 2, value: 0.5, detail: "centro → aro" },
-  { name: "Level",    index: 3, value: 0.8, detail: "" },
+// Field order mirrors DrumSpec / the ABI field indices exactly.
+const FIELDS = [
+  { key: "pitch_hz",         name: "Pitch",    min: 25,     max: 500,   log: true,  fmt: v => v.toFixed(1) + " Hz" },
+  { key: "air_load",         name: "Air load", min: 0,      max: 5,     log: false, fmt: v => v.toFixed(2) },
+  { key: "cavity_stiffness", name: "Cavity",   min: 0,      max: 2.5,   log: false, fmt: v => v.toFixed(2) },
+  { key: "t60_s",            name: "T60",      min: 0.05,   max: 6,     log: true,  fmt: v => v.toFixed(2) + " s" },
+  { key: "loss_slope",       name: "Loss slp", min: 1,      max: 3.5,   log: false, fmt: v => v.toFixed(2) },
+  { key: "contact_s",        name: "Contact",  min: 0.0004, max: 0.02,  log: true,  fmt: v => (v * 1000).toFixed(2) + " ms" },
+  { key: "strike_radius",    name: "Radius",   min: 0.02,   max: 0.98,  log: false, fmt: v => v.toFixed(2) },
+  { key: "gain",             name: "Gain",     min: 0,      max: 4,     log: false, fmt: v => v.toFixed(2) },
 ];
 
 const statusEl = document.getElementById("status");
-let node = null, analyser = null, context = null;
+const jsonEl = document.getElementById("json");
+let node = null, context = null;
+let selected = 2; // floor tom, el primer instrumento del plan
+const values = BODIES.map(() => FIELDS.map(() => null)); // seeded from wasm
 
 function setStatus(text, err = false) {
   statusEl.textContent = text;
   statusEl.className = err ? "err" : "";
 }
 
+// --- worklet ---
+const pendingReads = new Map();
 async function start() {
   if (context) return;
   context = new AudioContext({ latencyHint: "interactive" });
@@ -121,124 +143,154 @@ async function start() {
     outputChannelCount: [2],
     processorOptions: { wasmBytes },
   });
-  analyser = context.createAnalyser();
-  analyser.fftSize = 2048;
-  node.connect(analyser);
-  analyser.connect(context.destination);
-  for (const p of PARAMS) {
-    node.port.postMessage({ type: "param", index: p.index, value: p.value });
-  }
-  await context.resume();
-  setStatus(`sonando · ${context.sampleRate} Hz · latencia base ${Math.round(context.baseLatency * 1000)} ms`);
-  document.getElementById("start").style.display = "none";
-  drawScope();
-}
-
-function hit(note, velocity) {
-  if (!node) return;
-  node.port.postMessage({ type: "midi", data: [0x99, note, Math.max(1, Math.min(127, velocity | 0))] });
-}
-
-// --- pads: touch height = velocity ---
-const padsEl = document.getElementById("pads");
-for (const pad of PADS) {
-  const el = document.createElement("div");
-  el.className = "pad";
-  el.innerHTML = `<div class="flash"></div><div class="zone"></div>
-    <div class="name">${pad.name}</div>
-    <div class="hint">${pad.hint ?? ""} [${pad.key.toUpperCase()}]</div>`;
-  const strike = (event) => {
-    event.preventDefault();
-    const rect = el.getBoundingClientRect();
-    const y = (event.clientY - rect.top) / rect.height; // 0 top .. 1 bottom
-    const velocity = 127 * (1 - 0.85 * y);
-    hit(pad.note, velocity);
-    el.querySelector(".zone").textContent = `vel ${velocity | 0}`;
-    el.classList.add("hit");
-    requestAnimationFrame(() => requestAnimationFrame(() => el.classList.remove("hit")));
+  node.port.onmessage = (event) => {
+    const message = event.data;
+    if (message.type === "values" && pendingReads.has(message.tag)) {
+      pendingReads.get(message.tag)(message.values);
+      pendingReads.delete(message.tag);
+    }
   };
-  el.addEventListener("pointerdown", strike);
-  pad.el = el;
-  padsEl.appendChild(el);
+  node.connect(context.destination);
+  await context.resume();
+  setStatus(`sonando · ${context.sampleRate} Hz`);
+  document.getElementById("start").style.display = "none";
+  // Seed every body's faders from the engine's own defaults: the Rust
+  // table stays the single source of truth.
+  for (const body of BODIES) {
+    const base = SPEC_BASE + body.drum * SPEC_STRIDE;
+    const indices = FIELDS.map((_, field) => base + field);
+    const tag = `seed-${body.drum}`;
+    node.port.postMessage({ type: "read", indices, tag });
+    pendingReads.set(tag, (read) => {
+      values[body.drum] = read;
+      if (body.drum === selected) renderFaders();
+    });
+  }
 }
-document.addEventListener("keydown", (event) => {
-  if (event.repeat) return;
-  const pad = PADS.find((p) => p.key === event.key.toLowerCase());
-  if (!pad) return;
-  hit(pad.note, 110);
-  pad.el.classList.add("hit");
-  requestAnimationFrame(() => requestAnimationFrame(() => pad.el.classList.remove("hit")));
+
+function hit(velocity) {
+  if (!node) return;
+  node.port.postMessage({
+    type: "midi",
+    data: [0x99, BODIES[selected].note, Math.max(1, Math.min(127, velocity | 0))],
+  });
+  const pad = document.getElementById("pad");
+  pad.classList.add("hit");
+  requestAnimationFrame(() => requestAnimationFrame(() => pad.classList.remove("hit")));
+}
+
+// --- selector ---
+const bodiesEl = document.getElementById("bodies");
+BODIES.forEach((body, index) => {
+  const el = document.createElement("div");
+  el.className = "body" + (index === selected ? " sel" : "");
+  el.textContent = body.name;
+  el.addEventListener("pointerdown", () => {
+    selected = index;
+    document.querySelectorAll(".body").forEach((b, i) => b.classList.toggle("sel", i === selected));
+    renderFaders();
+    updateJson();
+  });
+  body.el = el;
+  bodiesEl.appendChild(el);
 });
 
-// --- parameter sliders over the real ABI ---
-const controlsEl = document.getElementById("controls");
-for (const p of PARAMS) {
-  const el = document.createElement("div");
-  el.className = "control";
-  el.innerHTML = `<label><b>${p.name}</b><span>${p.detail}</span></label>
-    <input type="range" min="0" max="1" step="0.001" value="${p.value}">`;
-  el.querySelector("input").addEventListener("input", (event) => {
-    p.value = Number(event.target.value);
-    if (node) node.port.postMessage({ type: "param", index: p.index, value: p.value });
+// --- pad ---
+const padEl = document.getElementById("pad");
+padEl.addEventListener("pointerdown", (event) => {
+  event.preventDefault();
+  const rect = padEl.getBoundingClientRect();
+  const y = (event.clientY - rect.top) / rect.height;
+  const velocity = 127 * (1 - 0.85 * y);
+  padEl.querySelector(".tag").textContent = `vel ${velocity | 0}`;
+  hit(velocity);
+});
+document.addEventListener("keydown", (event) => {
+  if (event.repeat) return;
+  if (event.key === " ") { event.preventDefault(); hit(110); }
+  const index = Number(event.key) - 1;
+  if (index >= 0 && index < BODIES.length) BODIES[index].el.dispatchEvent(new Event("pointerdown"));
+});
+
+// --- faders ---
+const fadersEl = document.getElementById("faders");
+const toSlider = (field, value) =>
+  field.log
+    ? Math.log(value / field.min) / Math.log(field.max / field.min)
+    : (value - field.min) / (field.max - field.min);
+const fromSlider = (field, t) =>
+  field.log ? field.min * Math.pow(field.max / field.min, t) : field.min + t * (field.max - field.min);
+
+function renderFaders() {
+  fadersEl.innerHTML = "";
+  const drumValues = values[selected];
+  FIELDS.forEach((field, fieldIndex) => {
+    const value = drumValues?.[fieldIndex];
+    const el = document.createElement("div");
+    el.className = "fader";
+    el.innerHTML = `<span class="name">${field.name}</span>
+      <input type="range" min="0" max="1" step="0.0005"
+             value="${value == null ? 0.5 : toSlider(field, value)}"
+             ${value == null ? "disabled" : ""}>
+      <span class="value">${value == null ? "…" : field.fmt(value)}</span>`;
+    const input = el.querySelector("input");
+    const valueEl = el.querySelector(".value");
+    input.addEventListener("input", () => {
+      const physical = fromSlider(field, Number(input.value));
+      values[selected][fieldIndex] = physical;
+      valueEl.textContent = field.fmt(physical);
+      node?.port.postMessage({
+        type: "param",
+        index: SPEC_BASE + BODIES[selected].drum * SPEC_STRIDE + fieldIndex,
+        value: physical,
+      });
+      updateJson();
+    });
+    fadersEl.appendChild(el);
   });
-  controlsEl.appendChild(el);
 }
+renderFaders();
 
-// --- oscilloscope + spectrum ---
-const canvas = document.getElementById("scope");
-const draw2d = canvas.getContext("2d");
-function drawScope() {
-  const dpr = devicePixelRatio || 1;
-  const width = canvas.clientWidth * dpr, height = canvas.clientHeight * dpr;
-  if (canvas.width !== width) { canvas.width = width; canvas.height = height; }
-  draw2d.clearRect(0, 0, width, height);
-
-  const wave = new Float32Array(analyser.fftSize);
-  analyser.getFloatTimeDomainData(wave);
-  draw2d.strokeStyle = "#f3bc7c";
-  draw2d.lineWidth = dpr;
-  draw2d.beginPath();
-  for (let i = 0; i < wave.length; i++) {
-    const x = (i / wave.length) * width;
-    const y = height * (0.5 - 0.45 * wave[i]);
-    i === 0 ? draw2d.moveTo(x, y) : draw2d.lineTo(x, y);
-  }
-  draw2d.stroke();
-
-  const spectrum = new Uint8Array(analyser.frequencyBinCount);
-  analyser.getByteFrequencyData(spectrum);
-  draw2d.fillStyle = "rgba(107,127,140,0.55)";
-  const bars = 96;
-  for (let i = 0; i < bars; i++) {
-    // log frequency axis, 30 Hz .. 12 kHz
-    const f0 = 30 * Math.pow(12000 / 30, i / bars);
-    const bin = Math.min(spectrum.length - 1, Math.round((f0 / (context.sampleRate / 2)) * spectrum.length));
-    const level = spectrum[bin] / 255;
-    const barWidth = width / bars;
-    draw2d.fillRect(i * barWidth, height * (1 - 0.95 * level), barWidth * 0.7, height * 0.95 * level);
-  }
-  requestAnimationFrame(drawScope);
+// --- copy parameters ---
+function currentJson() {
+  const drumValues = values[selected];
+  if (!drumValues || drumValues.some((v) => v == null)) return null;
+  const spec = { drum: BODIES[selected].slug };
+  FIELDS.forEach((field, index) => {
+    spec[field.key] = Number(drumValues[index].toPrecision(5));
+  });
+  return JSON.stringify(spec);
 }
+function updateJson() {
+  jsonEl.textContent = currentJson() ?? "arrancá el audio para leer los valores del motor";
+}
+document.getElementById("copy").addEventListener("click", async () => {
+  const json = currentJson();
+  if (!json) return setStatus("sin valores aún — arrancá el audio", true);
+  updateJson();
+  try {
+    await navigator.clipboard.writeText(json);
+    setStatus("parámetros copiados al portapapeles");
+  } catch {
+    // Clipboard puede fallar sin gesto confiable en Android; el JSON queda
+    // visible abajo para seleccionarlo a mano.
+    setStatus("clipboard bloqueado — copialo del recuadro", true);
+  }
+});
 
-// --- rebuild: the server runs cargo, the page reloads the new wasm ---
+// --- rebuild ---
 document.getElementById("rebuild").addEventListener("click", async () => {
   setStatus("compilando…");
   try {
     const result = await (await fetch("/build", { method: "POST" })).json();
-    if (result.ok) {
-      setStatus("compilado; recargando");
-      location.reload();
-    } else {
-      setStatus("build falló — mirá la consola", true);
-      console.error(result.output);
-    }
-  } catch (error) {
-    setStatus(`build error: ${error}`, true);
-  }
+    if (result.ok) { setStatus("compilado; recargando"); location.reload(); }
+    else { setStatus("build falló — consola", true); console.error(result.output); }
+  } catch (error) { setStatus(`build error: ${error}`, true); }
 });
 
 document.getElementById("start").addEventListener("click", () =>
   start().catch((error) => setStatus(`${error}`, true)));
+updateJson();
 </script>
 </body>
 </html>

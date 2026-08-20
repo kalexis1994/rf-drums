@@ -33,6 +33,14 @@ class RfDrumsProcessor extends AudioWorkletProcessor {
         this.abi.rackforge_set_parameter(message.index, message.value);
       } else if (message.type === "reset") {
         this.abi.rackforge_reset();
+      } else if (message.type === "read") {
+        // Read a run of parameters back out of the engine — the fader
+        // panel seeds itself from the wasm's own defaults, so the table in
+        // Rust stays the single source of truth.
+        const values = message.indices.map((index) =>
+          this.abi.rackforge_get_parameter(index),
+        );
+        this.port.postMessage({ type: "values", tag: message.tag, values });
       }
     };
   }
