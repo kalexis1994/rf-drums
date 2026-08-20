@@ -38,6 +38,9 @@ CARGO_ENV["PATH"] = "/root/.cargo/bin:" + CARGO_ENV.get("PATH", "")
 
 class Handler(SimpleHTTPRequestHandler):
     def do_GET(self):
+        # The page cache-busts the worklet with ?v=...; routes match on the
+        # bare path.
+        self.path = self.path.split("?", 1)[0]
         if self.path in ("/", "/index.html"):
             return self._file(os.path.join(ROOT, "web-dev", "index.html"), "text/html")
         if self.path == "/worklet.js":
