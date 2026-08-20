@@ -149,6 +149,28 @@ lesson: a strict reciprocal reading "comes out far darker than measured,
 because the felt hardens during contact". A stick tip on Mylar hardens more.
 `CONTACT_BRIGHTNESS = 8` is empirical and stated as such until targets exist.
 
+### The resonant head, tuned (tested)
+
+The bottom head is no longer just the breathing-mode split. Its coupled pair
+with the batter is solved as the real 2×2 eigenproblem — detuned heads, the
+cavity spring between them — and each eigenmode takes the stick's energy in
+its eigenvector's batter share (`couple_detuned_heads`, with the textbook
+equal-head split recovered as the special case and the limits tested). The
+`res_tune` fader is THE tom-tuning gesture: equal heads sing, a lower
+resonant head gives the falling "doooom", the snare-side head sits far above
+(~1.35×). The resonant head's own m ≥ 1 ladder rings at its tuning —
+unstruck, so longer — and the beat of the two (1,1)s at their detuning is
+the sung centre of a tom's sustain. Its coupling weight is a stated
+placeholder until the shell drive is continuous.
+
+### The kick's port (tested, stated placeholder)
+
+The vent's Helmholtz resonance: one oscillator below the head pitch, rung by
+the strike, gone in ~0.2 s — the modern kick's "whoomp" — plus the port's
+other half: an open cavity squeezes less, so the breathing pair's spring is
+relieved in proportion. The port frequency currently follows the described
+drum rather than a real cavity/neck geometry, and says so.
+
 ### The pair and the room (tested)
 
 The Concert Grand's ledger closed this argument for every modelled
@@ -200,15 +222,6 @@ targets, and the model's claim until then is the mechanisms, not the values.
   no linear modal answer. GM 38/40 currently sounds the drum with the snares
   thrown off, and says so. Plan: a collective wire model (mass-spring against
   the head's velocity, gated per control step), Avanzini/Serafin's family.
-* **The resonant head as a full membrane** — today the bottom head exists
-  only as the breathing-mode split. The real one carries its own complete
-  mode set and its own tuning, and the *detuning between heads* is THE
-  character control of a tom: equal heads sing, a lower resonant head gives
-  the falling "doooom", a higher one dries the note — it is what a drummer
-  tunes with the key.
-* **The kick's port (Helmholtz)** — the modern kick's "whoomp" is largely
-  the port's Helmholtz resonance; the cavity currently has a stiffness
-  constant, no resonator and no vent. One more oscillator, cheap.
 * **The kick's beater** — a longer, softer contact plus its own thump, and
   the burial (beater held against the head, killing the sustain — standard
   technique with no equivalent in the model yet).

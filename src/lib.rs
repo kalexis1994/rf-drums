@@ -19,8 +19,8 @@ pub mod membrane;
 
 use math::{expf, powf, sincosf, sqrtf};
 use membrane::{
-    BESSEL_ZEROS, MODE_COUNT, air_loaded_ratio, angular_order, couple_heads, modal_norm,
-    strike_shape, volume_displacement,
+    BESSEL_ZEROS, MODE_COUNT, air_loaded_ratio, angular_order, couple_detuned_heads,
+    modal_norm, strike_shape, volume_displacement,
 };
 use rackforge_plugin_sdk::{MidiEvent, ParameterEvent, Processor, export_processor};
 
@@ -44,7 +44,15 @@ const MAX_VOICES: usize = 8;
 const PAIR_BASE: usize = MODE_COUNT + membrane::RADIAL_ORDERS;
 const SHELL_BASE: usize = PAIR_BASE + (MODE_COUNT - membrane::RADIAL_ORDERS);
 const SHELL_MODES: usize = 4;
-const VOICE_MODES: usize = SHELL_BASE + SHELL_MODES;
+/// The resonant head's own m >= 1 ladder (its breathing modes already live
+/// inside the coupled eigenpairs): one partner per batter family, reached
+/// through the shell and the cavity, unstruck, so it rings longer than the
+/// head that was hit.
+const RES_BASE: usize = SHELL_BASE + SHELL_MODES;
+const RES_MODES: usize = MODE_COUNT - membrane::RADIAL_ORDERS;
+/// The kick port's Helmholtz resonance: one oscillator.
+const PORT_SLOT: usize = RES_BASE + RES_MODES;
+const VOICE_MODES: usize = PORT_SLOT + 1;
 
 /// How much brighter the contact is than a naive 1/(π·t) reading of its
 /// duration. The piano paid for this lesson first and its ledger states it:
@@ -138,7 +146,7 @@ const DIRECT_BUFFER: usize = 64;
 // will not list these; they are the calibration surface, not the panel.
 pub const SPEC_PARAM_BASE: u32 = 16;
 pub const SPEC_PARAM_STRIDE: u32 = 16;
-pub const SPEC_FIELDS: u32 = 10;
+pub const SPEC_FIELDS: u32 = 12;
 const FIELD_PITCH_HZ: u32 = 0;
 const FIELD_AIR_LOAD: u32 = 1;
 const FIELD_CAVITY: u32 = 2;
@@ -149,6 +157,8 @@ const FIELD_RADIUS: u32 = 6;
 const FIELD_GAIN: u32 = 7;
 const FIELD_CRACK: u32 = 8;
 const FIELD_SHELL: u32 = 9;
+const FIELD_RES_TUNE: u32 = 10;
+const FIELD_PORT: u32 = 11;
 
 /// One damped quadrature oscillator — the Concert Grand's `Component`,
 /// unchanged: rotation matrix pre-scaled by the per-sample decay, four
@@ -239,6 +249,14 @@ struct DrumSpec {
     /// the strike knocks alongside the head. This is the drum's body in the
     /// literal sense.
     shell: f32,
+    /// The resonant head's tuning as a ratio of the batter's — THE tom
+    /// tuning gesture. Equal heads sing; a lower resonant head gives the
+    /// falling "doooom"; the snare-side head sits far above (~1.35).
+    res_tune: f32,
+    /// The port's level: the vent hole's Helmholtz resonance, the modern
+    /// kick's "whoomp". Zero on unported drums. A port also relieves the
+    /// cavity spring (an open cavity squeezes less).
+    port: f32,
 }
 
 /// The drums the kit voices, in spec-table order.
@@ -274,6 +292,8 @@ fn default_specs() -> [DrumSpec; DRUM_COUNT] {
             gain: 1.6,
             crack: 1.2,
             shell: 0.7,
+            res_tune: 0.90,
+            port: 0.8,
         },
         // Snare 14" — WIRES NOT YET MODELLED; this is the drum with the
         // snares thrown off, and the ledger says so.
@@ -288,6 +308,8 @@ fn default_specs() -> [DrumSpec; DRUM_COUNT] {
             gain: 1.0,
             crack: 1.6,
             shell: 0.8,
+            res_tune: 1.35,
+            port: 0.0,
         },
         // Floor tom 16"
         DrumSpec {
@@ -301,6 +323,8 @@ fn default_specs() -> [DrumSpec; DRUM_COUNT] {
             gain: 1.25,
             crack: 1.0,
             shell: 0.7,
+            res_tune: 0.94,
+            port: 0.0,
         },
         // Low tom 13"
         DrumSpec {
@@ -314,6 +338,8 @@ fn default_specs() -> [DrumSpec; DRUM_COUNT] {
             gain: 1.15,
             crack: 1.0,
             shell: 0.7,
+            res_tune: 0.95,
+            port: 0.0,
         },
         // High tom 12"
         DrumSpec {
@@ -327,6 +353,8 @@ fn default_specs() -> [DrumSpec; DRUM_COUNT] {
             gain: 1.1,
             crack: 1.0,
             shell: 0.7,
+            res_tune: 0.95,
+            port: 0.0,
         },
     ]
 }
@@ -344,6 +372,8 @@ impl DrumSpec {
             FIELD_GAIN => self.gain as f64,
             FIELD_CRACK => self.crack as f64,
             FIELD_SHELL => self.shell as f64,
+            FIELD_RES_TUNE => self.res_tune as f64,
+            FIELD_PORT => self.port as f64,
             _ => return None,
         })
     }
@@ -362,6 +392,8 @@ impl DrumSpec {
             FIELD_GAIN => self.gain = value.clamp(0.0, 8.0),
             FIELD_CRACK => self.crack = value.clamp(0.0, 8.0),
             FIELD_SHELL => self.shell = value.clamp(0.0, 8.0),
+            FIELD_RES_TUNE => self.res_tune = value.clamp(0.6, 1.6),
+            FIELD_PORT => self.port = value.clamp(0.0, 4.0),
             _ => return false,
         }
         true
@@ -644,20 +676,25 @@ impl RfDrums {
             let t60 = Self::mode_t60(&spec, ratio_11, self.damp);
             let decay = decay_per_sample(t60, self.sample_rate);
             if m == 0 {
-                // The breathing pair: this head's (0,n) splits against the
-                // resonant head through the cavity. Both partners speak;
-                // the upper (air-stiffened) one carries the attack's punch
-                // and dies a little faster, the lower carries the boom.
-                let (lower, upper) = couple_heads(frequency, spec.cavity_stiffness);
+                // The breathing pair, with the real tuning between heads:
+                // the coupled eigenmodes of batter and resonant head, each
+                // taking the batter's blow in its eigenvector share. The
+                // port relieves the cavity spring — an open cavity squeezes
+                // less — which is half of what porting a kick does.
+                let cavity =
+                    spec.cavity_stiffness * (1.0 - 0.5 * spec.port.clamp(0.0, 1.0));
+                let ((f_lower, w_lower), (f_upper, w_upper)) =
+                    couple_detuned_heads(frequency, frequency * spec.res_tune, cavity);
                 let swept = volume_displacement(m, alpha).abs();
+                let base = amp * (0.6 + 0.45 * swept);
                 let n_index = index - (m as usize) * membrane::RADIAL_ORDERS;
-                voice.install(index, amp * 0.6, lower, decay, self.sample_rate);
+                voice.install(index, base * w_lower, f_lower, decay, self.sample_rate);
                 let upper_t60 = t60 * 0.7;
                 let upper_decay = decay_per_sample(upper_t60, self.sample_rate);
                 voice.install(
                     MODE_COUNT + n_index,
-                    amp * 0.55 * (0.5 + swept),
-                    upper,
+                    base * w_upper,
+                    f_upper,
                     upper_decay,
                     self.sample_rate,
                 );
@@ -678,7 +715,37 @@ impl RfDrums {
                     decay,
                     self.sample_rate,
                 );
+                // The resonant head's own ladder: the same family at the
+                // bottom head's tuning, reached through shell and cavity
+                // rather than struck, so it speaks softer and — unstruck,
+                // undamped by the stick — rings longer. The beat of the two
+                // (1,1)s at their detuning is the sung centre of a tom's
+                // sustain. Coupling weight is a stated placeholder until
+                // the shell drive is continuous.
+                voice.install(
+                    RES_BASE + (index - membrane::RADIAL_ORDERS),
+                    amp * 0.35,
+                    frequency * spec.res_tune,
+                    decay_per_sample(t60 * 1.6, self.sample_rate),
+                    self.sample_rate,
+                );
             }
+        }
+
+        // The port: the vent's Helmholtz resonance, rung by the breathing
+        // modes' displaced volume. One oscillator, air-fast decay, absent
+        // on unported drums. Its frequency follows the described drum (a
+        // stated placeholder pending real cavity/port geometry) and its
+        // relief of the cavity spring is applied above.
+        if spec.port > 0.01 {
+            let f_port = (0.75 * pitch).clamp(30.0, 90.0);
+            voice.install(
+                PORT_SLOT,
+                velocity_amp * spec.port * 1.4,
+                f_port,
+                decay_per_sample(0.18, self.sample_rate),
+                self.sample_rate,
+            );
         }
 
         // The shell: the drum's wooden body, knocked through the bearing
@@ -977,7 +1044,10 @@ impl Processor for RfDrums {
 /// rational soft clip, unity below the knee.
 fn soft_clip(x: f32) -> f32 {
     let x = x.clamp(-3.0, 3.0);
-    x * (27.0 + x * x) / (27.0 + 9.0 * x * x)
+    // The final clamp is not styling: the rational form reaches 1.0 exactly
+    // at the rail and f32 rounding can land a ulp above it (measured:
+    // 1.0000001 in a dense roll), which a host is entitled to reject.
+    (x * (27.0 + x * x) / (27.0 + 9.0 * x * x)).clamp(-1.0, 1.0)
 }
 
 export_processor!(
@@ -1159,9 +1229,11 @@ mod tests {
             let velocity = 60 + ((round * 13) % 67) as u8;
             let events = [MidiEvent { frame: 0, data: [0x99, note, velocity], length: 3 }];
             drums.process(&[], &mut output, &events, &[], 512, 0, 2);
+            let peak = output.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
+            let finite = output.iter().all(|x| x.is_finite());
             assert!(
-                output.iter().all(|x| x.is_finite() && x.abs() <= 1.0),
-                "round {round} produced bad samples"
+                finite && peak <= 1.0,
+                "round {round} produced bad samples: finite {finite}, peak {peak}"
             );
         }
     }
@@ -1319,6 +1391,52 @@ mod tests {
             .filter(|&index| voice.modes[index].is_live())
             .count();
         assert!(live_shell >= 2, "shell silent: {live_shell} modes");
+    }
+
+    /// The resonant head must be audible AS a second tuning: dropping
+    /// res_tune moves its ladder where the batter's is not, and the band at
+    /// the moved (1,1) partner must light up against the stock render.
+    #[test]
+    fn the_resonant_head_is_a_second_tuning() {
+        let base = SPEC_PARAM_BASE + 2 * SPEC_PARAM_STRIDE; // floor tom
+        let mut retuned = RfDrums::default();
+        assert!(retuned.prepare(48_000.0, 512, 0, 2));
+        assert!(retuned.set_parameter(base + FIELD_RES_TUNE, 0.80));
+        assert_eq!(retuned.get_parameter(base + FIELD_RES_TUNE), Some(0.800000011920929));
+        let moved = render(&mut retuned, 24_000, &strike(41, 110));
+        let mut stock = RfDrums::default();
+        assert!(stock.prepare(48_000.0, 512, 0, 2));
+        let stock_render = render(&mut stock, 24_000, &strike(41, 110));
+        // The (1,1) partner at 0.80 x 82 = 65.6 Hz sits in a gap of the
+        // stock spectrum (stock partner rings at 77 Hz).
+        let moved_band = band_energy(&moved, 48_000.0, 62.0, 70.0);
+        let stock_band = band_energy(&stock_render, 48_000.0, 62.0, 70.0);
+        assert!(
+            moved_band > stock_band * 2.5,
+            "res head inert: stock 62-70 Hz {stock_band}, res_tune 0.8 {moved_band}"
+        );
+    }
+
+    /// The ported kick must breathe below its head pitch — the Helmholtz
+    /// voice — and closing the port must take that breath away.
+    #[test]
+    fn the_kick_breathes_through_its_port() {
+        let base = SPEC_PARAM_BASE; // kick is drum 0
+        let render_with_port = |port: f64| {
+            let mut drums = RfDrums::default();
+            assert!(drums.prepare(48_000.0, 512, 0, 2));
+            assert!(drums.set_parameter(base + FIELD_PORT, port));
+            render(&mut drums, 24_000, &strike(36, 120))
+        };
+        let ported = render_with_port(0.8);
+        let closed = render_with_port(0.0);
+        // The port voice sits at 0.75 x 55 = 41 Hz.
+        let ported_band = band_energy(&ported, 48_000.0, 36.0, 47.0);
+        let closed_band = band_energy(&closed, 48_000.0, 36.0, 47.0);
+        assert!(
+            ported_band > closed_band * 1.5,
+            "port silent: closed {closed_band}, ported {ported_band}"
+        );
     }
 
     /// The spec faders must reach the engine: retuning the floor tom's pitch

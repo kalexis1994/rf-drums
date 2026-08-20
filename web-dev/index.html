@@ -114,7 +114,10 @@ const BODIES = [
   { name: "Tom 13",  slug: "tom-13",    note: 45, drum: 3 },
   { name: "Tom 12",  slug: "tom-12",    note: 48, drum: 4 },
 ];
-// Field order mirrors DrumSpec / the ABI field indices exactly.
+// Field order mirrors DrumSpec / the ABI field indices exactly. `seeds` are
+// a DISPLAY fallback per body so the faders work before (or without) the
+// engine's reply; once audio starts, untouched faders reconcile to what the
+// engine reports — Rust stays the source of truth.
 const FIELDS = [
   { key: "pitch_hz",         name: "Pitch",    min: 25,     max: 500,   log: true,  fmt: v => v.toFixed(1) + " Hz" },
   { key: "air_load",         name: "Air load", min: 0,      max: 5,     log: false, fmt: v => v.toFixed(2) },
@@ -126,18 +129,32 @@ const FIELDS = [
   { key: "gain",             name: "Gain",     min: 0,      max: 4,     log: false, fmt: v => v.toFixed(2) },
   { key: "crack",            name: "Crack",    min: 0,      max: 4,     log: false, fmt: v => v.toFixed(2) },
   { key: "shell",            name: "Shell",    min: 0,      max: 4,     log: false, fmt: v => v.toFixed(2) },
+  { key: "res_tune",         name: "Res head", min: 0.7,    max: 1.5,   log: false, fmt: v => "×" + v.toFixed(3) },
+  { key: "port",             name: "Port",     min: 0,      max: 2,     log: false, fmt: v => v.toFixed(2) },
+];
+const SEEDS = [
+  [55, 1.2, 0.9, 0.35, 1.6, 0.008, 0.10, 1.6, 1.2, 0.7, 0.90, 0.8],
+  [180, 0.35, 0.55, 0.5, 1.2, 0.0018, 0.45, 1.0, 1.6, 0.8, 1.35, 0.0],
+  [82, 0.6, 0.5, 1.3, 1.3, 0.0025, 0.4, 1.25, 1.0, 0.7, 0.94, 0.0],
+  [110, 0.5, 0.5, 1.0, 1.3, 0.002, 0.4, 1.15, 1.0, 0.7, 0.95, 0.0],
+  [140, 0.45, 0.5, 0.8, 1.3, 0.0018, 0.4, 1.1, 1.0, 0.7, 0.95, 0.0],
 ];
 
 const statusEl = document.getElementById("status");
 const jsonEl = document.getElementById("json");
 let node = null, context = null;
 let selected = 2; // floor tom, el primer instrumento del plan
-const values = BODIES.map(() => FIELDS.map(() => null)); // seeded from wasm
+const values = SEEDS.map((row) => row.slice());
+const touched = BODIES.map(() => FIELDS.map(() => false));
 
 function setStatus(text, err = false) {
   statusEl.textContent = text;
   statusEl.className = err ? "err" : "";
 }
+// Que ningún error muera en silencio: a la línea de estado.
+window.addEventListener("error", (e) => setStatus(`error: ${e.message}`, true));
+window.addEventListener("unhandledrejection", (e) =>
+  setStatus(`error: ${e.reason}`, true));
 
 // --- worklet ---
 const pendingReads = new Map();
@@ -145,12 +162,15 @@ async function start() {
   if (context) return;
   context = new AudioContext({ latencyHint: "interactive" });
   const wasmBytes = await (await fetch("rf_drums.wasm", { cache: "no-store" })).arrayBuffer();
-  await context.audioWorklet.addModule("worklet.js");
+  // Cache-bust del módulo: los worklets se cachean con más ganas que el
+  // resto y un worklet viejo deja la página entera muda de respuestas.
+  await context.audioWorklet.addModule("worklet.js?v=" + Date.now());
   node = new AudioWorkletNode(context, "rf-drums", {
     numberOfInputs: 0,
     outputChannelCount: [2],
     processorOptions: { wasmBytes },
   });
+  node.onprocessorerror = () => setStatus("el procesador de audio murió", true);
   node.port.onmessage = (event) => {
     const message = event.data;
     if (message.type === "values" && pendingReads.has(message.tag)) {
@@ -162,18 +182,31 @@ async function start() {
   await context.resume();
   setStatus(`sonando · ${context.sampleRate} Hz`);
   document.getElementById("start").style.display = "none";
-  // Seed every body's faders from the engine's own defaults: the Rust
-  // table stays the single source of truth.
+  // Reenviar lo que el usuario ya movió antes de arrancar, y reconciliar lo
+  // demás con los valores del motor (Rust manda).
   for (const body of BODIES) {
     const base = SPEC_BASE + body.drum * SPEC_STRIDE;
+    FIELDS.forEach((_, field) => {
+      if (touched[body.drum][field]) {
+        node.port.postMessage({
+          type: "param", index: base + field, value: values[body.drum][field],
+        });
+      }
+    });
     const indices = FIELDS.map((_, field) => base + field);
     const tag = `seed-${body.drum}`;
     node.port.postMessage({ type: "read", indices, tag });
     pendingReads.set(tag, (read) => {
-      values[body.drum] = read;
+      read.forEach((value, field) => {
+        if (!touched[body.drum][field] && Number.isFinite(value)) {
+          values[body.drum][field] = value;
+        }
+      });
       if (body.drum === selected) renderFaders();
     });
   }
+  node.port.postMessage({ type: "param", index: 4, value: room.mix });
+  node.port.postMessage({ type: "param", index: 5, value: room.size });
 }
 
 function hit(velocity) {
@@ -233,19 +266,19 @@ function renderFaders() {
   fadersEl.innerHTML = "";
   const drumValues = values[selected];
   FIELDS.forEach((field, fieldIndex) => {
-    const value = drumValues?.[fieldIndex];
+    const value = drumValues[fieldIndex];
     const el = document.createElement("div");
     el.className = "fader";
     el.innerHTML = `<span class="name">${field.name}</span>
       <input type="range" min="0" max="1" step="0.0005"
-             value="${value == null ? 0.5 : toSlider(field, value)}"
-             ${value == null ? "disabled" : ""}>
-      <span class="value">${value == null ? "…" : field.fmt(value)}</span>`;
+             value="${toSlider(field, value)}">
+      <span class="value">${field.fmt(value)}</span>`;
     const input = el.querySelector("input");
     const valueEl = el.querySelector(".value");
     input.addEventListener("input", () => {
       const physical = fromSlider(field, Number(input.value));
       values[selected][fieldIndex] = physical;
+      touched[selected][fieldIndex] = true;
       valueEl.textContent = field.fmt(physical);
       node?.port.postMessage({
         type: "param",

@@ -162,25 +162,57 @@ pub fn volume_displacement(m: u32, alpha: f32) -> f32 {
     core::f32::consts::TAU * besselj(1, alpha) / alpha
 }
 
-/// Splits one breathing mode into the pair two coupled heads actually have.
+/// The two heads' coupled pair, with the detuning a drummer actually tunes.
 ///
-/// Batter and resonant head share the enclosed air. Their `(0, n)` modes come
-/// in two combinations: the two heads moving the same way in space — one
-/// following the other, the cavity's volume nearly unchanged — and the two
-/// moving oppositely, squeezing the air between them. The first sees no air
-/// spring and stays near the free head's frequency; the second is stiffened
-/// by it and rises. Returned as `(lower, upper)`.
+/// Batter and resonant head share the enclosed air. With the cavity spring
+/// coupling their breathing modes, the 2×2 system
 ///
-/// `stiffness` is `2·K_air/ω₀²` — the air spring's share, dimensionless.
+/// ```text
+/// | ω₁²+K    K   |          K = s·ω₁²/2,  s = the cavity's share
+/// |   K    ω₂²+K |
+/// ```
 ///
-/// Structurally this is the same problem as the Concert Grand's unison: two
-/// oscillators that would be independent, made into a fast pair and a slow
-/// pair by one shared termination. The lesson carried over from that work is
-/// that the coupling must be *passive*, or configurations appear that gain
-/// energy; here that is automatic, because the split is in the frequencies
-/// rather than in a feedback path.
-pub fn couple_heads(frequency: f32, stiffness: f32) -> (f32, f32) {
-    (frequency, frequency * sqrtf(1.0 + stiffness.max(0.0)))
+/// has two eigenmodes: heads following each other (cavity barely squeezed,
+/// frequency near the free heads') and heads squeezing the air (stiffened,
+/// raised). Equal heads recover the textbook split (f, f·√(1+s)); detuned
+/// heads — the resonant head tuned above or below the batter, which is THE
+/// tom-tuning gesture — put each eigenmode partly on each head, and the
+/// batter's share of each is its excitation weight when the stick lands.
+///
+/// Returns `((f_lower, weight), (f_upper, weight))`, weights summing to one
+/// (completeness of the eigenbasis: drive and readout are both the batter).
+///
+/// Structurally the Concert Grand's unison one door over; passivity is
+/// automatic here because the coupling lives in the frequencies, not in a
+/// feedback path.
+pub fn couple_detuned_heads(
+    batter_hz: f32,
+    resonant_hz: f32,
+    stiffness: f32,
+) -> ((f32, f32), (f32, f32)) {
+    let w1 = batter_hz * batter_hz;
+    let w2 = resonant_hz * resonant_hz;
+    let k = 0.5 * stiffness.max(0.0) * w1;
+    if k < 1.0e-12 {
+        // No cavity: the heads never talk, the stick only reaches its own.
+        return ((batter_hz, 1.0), (resonant_hz, 0.0));
+    }
+    let a = w1 + k;
+    let b = w2 + k;
+    let gap = sqrtf((a - b) * (a - b) + 4.0 * k * k);
+    let lower = 0.5 * (a + b - gap);
+    let upper = 0.5 * (a + b + gap);
+    // Eigenvector for λ: [K, λ − A] (from the first row); the batter's
+    // squared share of the normalized vector is the weight.
+    let weight = |lambda: f32| {
+        let v0 = k;
+        let v1 = lambda - a;
+        v0 * v0 / (v0 * v0 + v1 * v1)
+    };
+    (
+        (sqrtf(lower.max(0.0)), weight(lower)),
+        (sqrtf(upper), weight(upper)),
+    )
 }
 
 #[cfg(test)]
@@ -262,13 +294,27 @@ mod tests {
         }
     }
 
-    /// The air spring stiffens one combination and leaves the other alone.
+    /// Equal heads recover the textbook split with equal shares; detuned
+    /// heads put the batter's energy mostly on its own eigenmode; no cavity
+    /// means no conversation at all.
     #[test]
-    fn coupled_heads_split_around_the_free_frequency() {
-        let (lower, upper) = couple_heads(100.0, 0.4);
-        assert!((lower - 100.0).abs() < 1e-4, "lower {lower}");
-        assert!(upper > 117.0 && upper < 119.0, "upper {upper}");
-        let (l0, u0) = couple_heads(100.0, 0.0);
-        assert!((l0 - u0).abs() < 1e-4, "no cavity, no split");
+    fn coupled_heads_split_and_share_as_the_physics_says() {
+        // Equal heads, s = 0.4: (f, f·√1.4), weights 1/2 and 1/2.
+        let ((lo, w_lo), (hi, w_hi)) = couple_detuned_heads(100.0, 100.0, 0.4);
+        assert!((lo - 100.0).abs() < 0.01, "lower {lo}");
+        assert!((hi - 100.0 * 1.4f32.sqrt()).abs() < 0.05, "upper {hi}");
+        assert!((w_lo - 0.5).abs() < 1e-3 && (w_hi - 0.5).abs() < 1e-3);
+        // Weights always complete: the batter's blow lands somewhere.
+        assert!((w_lo + w_hi - 1.0).abs() < 1e-4);
+        // Resonant head tuned well below, weak spring: the lower eigenmode
+        // is mostly the resonant head (small batter weight), the upper is
+        // mostly the batter.
+        let ((lo, w_lo), (hi, w_hi)) = couple_detuned_heads(100.0, 70.0, 0.1);
+        assert!(lo < 75.0 && hi > 99.0, "{lo} {hi}");
+        assert!(w_lo < 0.1 && w_hi > 0.9, "weights {w_lo} {w_hi}");
+        // No cavity: each head keeps its own frequency, stick reaches only
+        // the batter.
+        let ((lo, w_lo), (_, w_hi)) = couple_detuned_heads(100.0, 80.0, 0.0);
+        assert!((lo - 100.0).abs() < 1e-3 && w_lo == 1.0 && w_hi == 0.0);
     }
 }
