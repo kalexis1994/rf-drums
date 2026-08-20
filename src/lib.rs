@@ -30,10 +30,49 @@ use rackforge_plugin_sdk::{MidiEvent, ParameterEvent, Processor, export_processo
 /// ceiling the Concert Grand taught us to respect.
 const MAX_VOICES: usize = 8;
 
-/// Modes per voice: the 45 membrane families, plus the upper partner of each
-/// breathing-mode pair (the two-head split doubles only the five `(0, n)`
-/// modes — the `cos(mθ)` families sweep no volume and have no partner).
-const VOICE_MODES: usize = MODE_COUNT + membrane::RADIAL_ORDERS;
+/// Modes per voice, in fixed layout:
+///
+/// * `[0..45)` — the membrane families (lower head-pair partner for m = 0);
+/// * `[45..50)` — the upper (air-stiffened) breathing partners;
+/// * `[50..90)` — the degenerate twins of every m ≥ 1 family. A `cos(mθ)`
+///   mode has a `sin(mθ)` twin at the same ideal frequency; real heads split
+///   the pair a few cents through non-uniform hoop tension, and the beat
+///   between them is what makes a drum partial breathe instead of holding a
+///   synthesizer's dead-straight sine (Rossing, *Science of Percussion
+///   Instruments*, on near-degenerate mode pairs in real drums);
+/// * `[90..94)` — the shell's wood modes.
+const PAIR_BASE: usize = MODE_COUNT + membrane::RADIAL_ORDERS;
+const SHELL_BASE: usize = PAIR_BASE + (MODE_COUNT - membrane::RADIAL_ORDERS);
+const SHELL_MODES: usize = 4;
+const VOICE_MODES: usize = SHELL_BASE + SHELL_MODES;
+
+/// How much brighter the contact is than a naive 1/(π·t) reading of its
+/// duration. The piano paid for this lesson first and its ledger states it:
+/// a strict reciprocal-of-the-pulse cutoff "comes out far darker than
+/// measured spectra, because the felt hardens during contact". A stick tip
+/// on Mylar hardens harder than felt on wire. Without this the floor tom's
+/// cutoff sat at 127 Hz — the entire Bessel ladder buried, fundamentals
+/// alone left standing, which the user's ear named exactly: "suena como
+/// samples de batería electrónica tipo 808". An 808 tom IS a decaying
+/// sine; that is what a modal bank with its ladder filtered off becomes.
+/// Empirical, and stated as such until targets exist.
+const CONTACT_BRIGHTNESS: f32 = 8.0;
+
+/// Tension-modulation glide: a struck membrane is stretched by its own
+/// displacement, so every mode starts sharp by the same fraction and
+/// settles as the amplitude dies — Kirchhoff–Carrier, the piano's ff glide
+/// one instrument over, but far larger here because a drumhead moves
+/// millimetres where a string moves tenths. The fortissimo onset reaches
+/// GLIDE_MAX (≈ +1 semitone) and relaxes with GLIDE_TAU. Placeholder
+/// values in the measured order of magnitude for toms; the 808 fakes this
+/// very curve with a pitch envelope, which is why a model without it reads
+/// as the 808 and not as the drum.
+const GLIDE_MAX: f32 = 0.06;
+const GLIDE_TAU_S: f32 = 0.05;
+/// The twins' tension split, as a fraction of each mode's frequency, and
+/// the per-mode jitter around it — a uniform split would make every pair
+/// beat at a rate proportional to frequency, the piano's "shimmer" defect.
+const PAIR_SPLIT: f32 = 0.004;
 
 /// A struck mode below this magnitude² is spent; retired at block edges,
 /// exactly the Concert Grand's cull.
@@ -61,7 +100,7 @@ pub const PARAM_COUNT: usize = 4;
 // will not list these; they are the calibration surface, not the panel.
 pub const SPEC_PARAM_BASE: u32 = 16;
 pub const SPEC_PARAM_STRIDE: u32 = 16;
-pub const SPEC_FIELDS: u32 = 8;
+pub const SPEC_FIELDS: u32 = 10;
 const FIELD_PITCH_HZ: u32 = 0;
 const FIELD_AIR_LOAD: u32 = 1;
 const FIELD_CAVITY: u32 = 2;
@@ -70,6 +109,8 @@ const FIELD_LOSS_SLOPE: u32 = 4;
 const FIELD_CONTACT_S: u32 = 5;
 const FIELD_RADIUS: u32 = 6;
 const FIELD_GAIN: u32 = 7;
+const FIELD_CRACK: u32 = 8;
+const FIELD_SHELL: u32 = 9;
 
 /// One damped quadrature oscillator — the Concert Grand's `Component`,
 /// unchanged: rotation matrix pre-scaled by the per-sample decay, four
@@ -151,6 +192,15 @@ struct DrumSpec {
     strike_radius: f32,
     /// Overall voicing gain.
     gain: f32,
+    /// The stick's impact noise level. The crack is most of a drum hit's
+    /// first ten milliseconds and no arrangement of modal amplitudes can
+    /// stand in for it — the piano's action-noise lesson, which percussion
+    /// pays double.
+    crack: f32,
+    /// The wood shell's level: a handful of stiff, fast-dying resonances
+    /// the strike knocks alongside the head. This is the drum's body in the
+    /// literal sense.
+    shell: f32,
 }
 
 /// The drums the kit voices, in spec-table order.
@@ -184,6 +234,8 @@ fn default_specs() -> [DrumSpec; DRUM_COUNT] {
             contact_s: 0.008,
             strike_radius: 0.10,
             gain: 1.6,
+            crack: 1.2,
+            shell: 0.7,
         },
         // Snare 14" — WIRES NOT YET MODELLED; this is the drum with the
         // snares thrown off, and the ledger says so.
@@ -196,6 +248,8 @@ fn default_specs() -> [DrumSpec; DRUM_COUNT] {
             contact_s: 0.0018,
             strike_radius: 0.45,
             gain: 1.0,
+            crack: 1.6,
+            shell: 0.8,
         },
         // Floor tom 16"
         DrumSpec {
@@ -207,6 +261,8 @@ fn default_specs() -> [DrumSpec; DRUM_COUNT] {
             contact_s: 0.0025,
             strike_radius: 0.4,
             gain: 1.25,
+            crack: 1.0,
+            shell: 0.7,
         },
         // Low tom 13"
         DrumSpec {
@@ -218,6 +274,8 @@ fn default_specs() -> [DrumSpec; DRUM_COUNT] {
             contact_s: 0.002,
             strike_radius: 0.4,
             gain: 1.15,
+            crack: 1.0,
+            shell: 0.7,
         },
         // High tom 12"
         DrumSpec {
@@ -229,6 +287,8 @@ fn default_specs() -> [DrumSpec; DRUM_COUNT] {
             contact_s: 0.0018,
             strike_radius: 0.4,
             gain: 1.1,
+            crack: 1.0,
+            shell: 0.7,
         },
     ]
 }
@@ -244,6 +304,8 @@ impl DrumSpec {
             FIELD_CONTACT_S => self.contact_s as f64,
             FIELD_RADIUS => self.strike_radius as f64,
             FIELD_GAIN => self.gain as f64,
+            FIELD_CRACK => self.crack as f64,
+            FIELD_SHELL => self.shell as f64,
             _ => return None,
         })
     }
@@ -260,6 +322,8 @@ impl DrumSpec {
             FIELD_CONTACT_S => self.contact_s = value.clamp(0.000_2, 0.05),
             FIELD_RADIUS => self.strike_radius = value.clamp(0.02, 0.98),
             FIELD_GAIN => self.gain = value.clamp(0.0, 8.0),
+            FIELD_CRACK => self.crack = value.clamp(0.0, 8.0),
+            FIELD_SHELL => self.shell = value.clamp(0.0, 8.0),
             _ => return false,
         }
         true
@@ -269,6 +333,22 @@ impl DrumSpec {
 #[derive(Clone, Copy)]
 struct Voice {
     modes: [Mode; VOICE_MODES],
+    /// Each mode's rest frequency (rad/sample) and per-sample decay, kept so
+    /// the glide can rebuild `rc`/`rs` at control rate. Rebuilding from the
+    /// stored decay is exactly norm-preserving — the piano's tension-glide
+    /// bug (each nudge scaling the decay by √(1+step²) until A0 diverged)
+    /// cannot happen by construction.
+    omega: [f32; VOICE_MODES],
+    decay: [f32; VOICE_MODES],
+    /// Current tension sharpening, as a fraction of each mode's frequency;
+    /// decays toward zero at control rate.
+    glide: f32,
+    /// The crack: an exponentially dying, one-pole-low-passed noise burst.
+    crack_amp: f32,
+    crack_decay: f32,
+    crack_lp: f32,
+    crack_state: f32,
+    rng: u32,
     active: bool,
     note: u8,
     age: u32,
@@ -276,7 +356,66 @@ struct Voice {
 
 impl Default for Voice {
     fn default() -> Self {
-        Self { modes: [Mode::default(); VOICE_MODES], active: false, note: 0, age: 0 }
+        Self {
+            modes: [Mode::default(); VOICE_MODES],
+            omega: [0.0; VOICE_MODES],
+            decay: [0.0; VOICE_MODES],
+            glide: 0.0,
+            crack_amp: 0.0,
+            crack_decay: 0.0,
+            crack_lp: 0.0,
+            crack_state: 0.0,
+            rng: 1,
+            active: false,
+            note: 0,
+            age: 0,
+        }
+    }
+}
+
+impl Voice {
+    /// Installs a struck mode and remembers its rest rotation for the glide.
+    fn install(&mut self, index: usize, amp: f32, frequency: f32, decay: f32, rate: f32) {
+        self.modes[index] = Mode::strike(amp, frequency, decay, rate);
+        if self.modes[index].is_live() {
+            self.omega[index] = core::f32::consts::TAU * frequency / rate;
+            self.decay[index] = decay;
+        }
+    }
+
+    /// One control step of tension relaxation: every membrane mode's
+    /// rotation is rebuilt at its rest frequency times (1 + glide). Shell
+    /// modes ([SHELL_BASE..]) are wood and do not retension.
+    fn relax(&mut self, glide_keep: f32) {
+        if self.glide < 1.0e-4 {
+            self.glide = 0.0;
+            return;
+        }
+        self.glide *= glide_keep;
+        let sharpen = 1.0 + self.glide;
+        for index in 0..SHELL_BASE {
+            if !self.modes[index].is_live() {
+                continue;
+            }
+            let (sin, cos) = sincosf(self.omega[index] * sharpen);
+            self.modes[index].rc = self.decay[index] * cos;
+            self.modes[index].rs = self.decay[index] * sin;
+        }
+    }
+
+    /// The crack's next sample: white noise through a one-pole low-pass,
+    /// dying exponentially. Three multiplies and an LCG once the burst is
+    /// spent below audibility it costs a compare.
+    #[inline(always)]
+    fn crack_tick(&mut self) -> f32 {
+        if self.crack_amp < 1.0e-6 {
+            return 0.0;
+        }
+        self.rng = self.rng.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        let white = (self.rng >> 8) as f32 * (1.0 / 8_388_608.0) - 1.0;
+        self.crack_state += self.crack_lp * (white - self.crack_state);
+        self.crack_amp *= self.crack_decay;
+        self.crack_state * self.crack_amp
     }
 }
 
@@ -360,13 +499,31 @@ impl RfDrums {
         // Contact time lengthens for soft blows (a stick thrown gently sinks
         // into the head longer), shortening — brightening — with velocity.
         let contact = spec.contact_s * (1.6 - 0.8 * velocity_01);
-        // Second-order low-pass over modal amplitudes at the contact's
-        // reciprocal: the stick's finite dwell cannot feed modes whose
-        // period it straddles. Same construction as the piano's felt filter.
-        let cutoff = 1.0 / (core::f32::consts::PI * contact);
+        // Second-order low-pass over modal amplitudes tied to the contact's
+        // reciprocal — same construction as the piano's felt filter, and
+        // with the piano's empirical brightness factor (see
+        // CONTACT_BRIGHTNESS: the naive reciprocal buried the whole ladder
+        // and left an 808).
+        let cutoff = CONTACT_BRIGHTNESS / (core::f32::consts::PI * contact);
 
         let f11 = pitch;
         let velocity_amp = 0.12 * spec.gain * (0.25 + 0.75 * velocity_01 * velocity_01);
+
+        // Tension modulation: the blow stretches the head, the pitch starts
+        // sharp and settles. Kirchhoff–Carrier scales with the square of the
+        // displacement, so the glide follows velocity².
+        voice.glide = GLIDE_MAX * velocity_01 * velocity_01;
+
+        // The crack: the stick's own broadband impact, brighter and louder
+        // for the hard blow, its bandwidth tied to the same contact time
+        // that shapes the modal ladder.
+        let crack_cutoff =
+            (2.5 / (core::f32::consts::TAU * contact)).min(0.45 * self.sample_rate);
+        voice.crack_amp = 0.5 * spec.crack * spec.gain * (0.1 + 0.9 * velocity_01 * velocity_01);
+        voice.crack_decay = expf(-1.0 / (2.5 * contact * self.sample_rate));
+        voice.crack_lp =
+            1.0 - expf(-core::f32::consts::TAU * crack_cutoff / self.sample_rate);
+        voice.rng = 0x9e37_79b9 ^ ((note as u32) << 8) ^ (velocity as u32);
 
         for (index, &alpha) in BESSEL_ZEROS.iter().enumerate() {
             let m = angular_order(index);
@@ -399,19 +556,56 @@ impl RfDrums {
                 let (lower, upper) = couple_heads(frequency, spec.cavity_stiffness);
                 let swept = volume_displacement(m, alpha).abs();
                 let n_index = index - (m as usize) * membrane::RADIAL_ORDERS;
-                voice.modes[index] =
-                    Mode::strike(amp * 0.6, lower, decay, self.sample_rate);
+                voice.install(index, amp * 0.6, lower, decay, self.sample_rate);
                 let upper_t60 = t60 * 0.7;
                 let upper_decay = decay_per_sample(upper_t60, self.sample_rate);
-                voice.modes[MODE_COUNT + n_index] = Mode::strike(
+                voice.install(
+                    MODE_COUNT + n_index,
                     amp * 0.55 * (0.5 + swept),
                     upper,
                     upper_decay,
                     self.sample_rate,
                 );
             } else {
-                voice.modes[index] = Mode::strike(amp, frequency, decay, self.sample_rate);
+                // The degenerate pair: cos(mθ) and its sin(mθ) twin, split a
+                // few cents by non-uniform hoop tension, sharing the strike's
+                // energy. Their beat is what keeps the partial alive to the
+                // ear. The split is jittered per (drum, mode) — uniform
+                // splitting is the shimmer defect the piano documented.
+                let split = frequency
+                    * PAIR_SPLIT
+                    * (0.4 + 1.2 * hash01((note as u32) << 8 | index as u32));
+                voice.install(index, amp * 0.6, frequency, decay, self.sample_rate);
+                voice.install(
+                    PAIR_BASE + (index - membrane::RADIAL_ORDERS),
+                    amp * 0.5,
+                    frequency + split,
+                    decay,
+                    self.sample_rate,
+                );
             }
+        }
+
+        // The shell: the drum's wooden body, knocked through the bearing
+        // edge. A handful of stiff resonances well above the head's pitch,
+        // dying at wood's loss factor in tens of milliseconds — the knock
+        // that says the head is mounted on something. Frequencies follow the
+        // pitch (a bigger drum has a bigger, deeper shell), jittered per
+        // drum so no two shells are the same barrel. Driven-through-the-rim
+        // continuously is the honest model; strike-seeded is the stated
+        // simplification, the same one the piano's clack accepts.
+        let shell_ratios = [3.3f32, 4.9, 6.4, 8.4];
+        for (slot, &ratio) in shell_ratios.iter().enumerate() {
+            let jitter = 0.9 + 0.2 * hash01((note as u32) << 16 | slot as u32);
+            let frequency = f11 * ratio * jitter;
+            let ratio_cut = frequency / cutoff;
+            let contact_lp = 1.0 / (1.0 + ratio_cut * ratio_cut);
+            let amp = velocity_amp * spec.shell * 0.35 * contact_lp
+                / (1.0 + slot as f32 * 0.6);
+            // Wood at ~3% loss: T60 = ln(1000)/(π·f·η).
+            let t60 = 6.907_755 / (core::f32::consts::PI * frequency * 0.03);
+            let decay = decay_per_sample(t60, self.sample_rate);
+            voice.install(SHELL_BASE + slot, amp, frequency, decay, self.sample_rate);
         }
     }
 
@@ -424,11 +618,14 @@ impl RfDrums {
         }
     }
 
+    /// The control step: tension relaxation, then the cull.
     fn cull(&mut self) {
+        let glide_keep = expf(-(CULL_INTERVAL as f32) / (GLIDE_TAU_S * self.sample_rate));
         for voice in self.voices.iter_mut() {
             if !voice.active {
                 continue;
             }
+            voice.relax(glide_keep);
             voice.age = voice.age.saturating_add(1);
             let mut live = false;
             for mode in voice.modes.iter_mut() {
@@ -486,6 +683,19 @@ impl RfDrums {
 fn decay_per_sample(t60: f32, sample_rate: f32) -> f32 {
     // e^(−ln(1000)/(T60·rate)); ln(1000) = 6.9078.
     expf(-6.907_755 / (t60.max(0.01) * sample_rate))
+}
+
+/// Deterministic 0..1 hash (Wang-style avalanche) — the Concert Grand's
+/// source of per-partial irregularity, and this model's too. Same drum, same
+/// mode, same split: repeatability is part of sounding like one particular
+/// kit.
+fn hash01(mut seed: u32) -> f32 {
+    seed = (seed ^ 61) ^ (seed >> 16);
+    seed = seed.wrapping_mul(9);
+    seed ^= seed >> 4;
+    seed = seed.wrapping_mul(0x27d4_eb2d);
+    seed ^= seed >> 15;
+    (seed >> 8) as f32 * (1.0 / 16_777_216.0)
 }
 
 impl Processor for RfDrums {
@@ -554,6 +764,7 @@ impl Processor for RfDrums {
                 for mode in voice.modes.iter_mut() {
                     sum += mode.tick();
                 }
+                sum += voice.crack_tick();
             }
             let sample = soft_clip(sum * level);
             for channel in 0..channels {
@@ -761,6 +972,80 @@ mod tests {
         }
     }
 
+    /// The attack must be NOISY — broadband crack over the modal ladder —
+    /// and the noise must be gone by the sustain. A clean modal attack is
+    /// the 808 the user's ear caught; the piano's noisiness metric made the
+    /// same absence measurable there.
+    #[test]
+    fn the_attack_cracks_and_the_sustain_rings() {
+        let mut drums = RfDrums::default();
+        assert!(drums.prepare(48_000.0, 512, 0, 2));
+        let out = render(&mut drums, 24_000, &strike(41, 115));
+        let attack = &out[..2 * 1440]; // first 30 ms
+        let sustain = &out[2 * 14_400..2 * 15_840]; // 300-330 ms
+        let high = |window: &[f32]| band_energy(window, 48_000.0, 2500.0, 8000.0);
+        let attack_high = high(attack);
+        let sustain_high = high(sustain);
+        assert!(
+            attack_high > sustain_high * 30.0,
+            "no crack: attack 2.5-8 kHz {attack_high}, sustain {sustain_high}"
+        );
+    }
+
+    /// The struck head starts sharp and settles: tension-modulation glide.
+    /// State-level check — the render-level pitch trace belongs to the
+    /// calibration tooling.
+    #[test]
+    fn a_hard_strike_starts_sharp_and_relaxes() {
+        let mut drums = RfDrums::default();
+        assert!(drums.prepare(48_000.0, 512, 0, 2));
+        let mut output = vec![0.0f32; 512 * 2];
+        drums.process(&[], &mut output, &strike(41, 127), &[], 512, 0, 2);
+        let just_struck = drums.voices[0].glide;
+        assert!(
+            just_struck > 0.04,
+            "ff strike not sharp: glide {just_struck}"
+        );
+        for _ in 0..40 {
+            // ~430 ms
+            drums.process(&[], &mut output, &[], &[], 512, 0, 2);
+        }
+        let settled = drums.voices[0].glide;
+        assert!(
+            settled < just_struck * 0.05,
+            "glide never settles: {just_struck} -> {settled}"
+        );
+        // And a soft blow barely bends: the glide is amplitude physics, not
+        // an envelope bolted to the note.
+        let mut soft = RfDrums::default();
+        assert!(soft.prepare(48_000.0, 512, 0, 2));
+        soft.process(&[], &mut output, &strike(41, 30), &[], 512, 0, 2);
+        assert!(
+            soft.voices[0].glide < just_struck * 0.15,
+            "soft blow bends like a hard one: {}",
+            soft.voices[0].glide
+        );
+    }
+
+    /// Every m >= 1 partial is a detuned twin pair — the beat that keeps a
+    /// drum partial breathing. An off-centre strike must light both banks.
+    #[test]
+    fn the_partials_come_in_beating_pairs() {
+        let mut drums = RfDrums::default();
+        assert!(drums.prepare(48_000.0, 512, 0, 2));
+        let mut output = vec![0.0f32; 512 * 2];
+        drums.process(&[], &mut output, &strike(41, 110), &[], 512, 0, 2);
+        let voice = &drums.voices[0];
+        let live_pairs = (PAIR_BASE..SHELL_BASE)
+            .filter(|&index| voice.modes[index].is_live())
+            .count();
+        assert!(live_pairs > 10, "only {live_pairs} twin modes live");
+        let live_shell = (SHELL_BASE..VOICE_MODES)
+            .filter(|&index| voice.modes[index].is_live())
+            .count();
+        assert!(live_shell >= 2, "shell silent: {live_shell} modes");
+    }
+
     /// The spec faders must reach the engine: retuning the floor tom's pitch
     /// through the parameter surface must move the rendered spectrum, and
     /// reading it back must return what was written.
@@ -779,8 +1064,11 @@ mod tests {
         // drum whose pitch fader moved may hold it. (Comparing bands within
         // ONE render confounds — a 130 Hz tom's breathing (0,1) lands right
         // back in the 82 Hz drum's fundamental band.)
-        let retuned = band_energy(&retuned_render, 48_000.0, 120.0, 142.0);
-        let stock = band_energy(&stock_render, 48_000.0, 120.0, 142.0);
+        // A narrow band on the retuned (1,1) itself: the stock drum's (2,1)
+        // sits at ~115 Hz and its crack is broadband, both legitimately near
+        // the old wide band now that the ladder actually radiates.
+        let retuned = band_energy(&retuned_render, 48_000.0, 124.0, 137.0);
+        let stock = band_energy(&stock_render, 48_000.0, 124.0, 137.0);
         assert!(
             retuned > stock * 3.0,
             "pitch fader inert: stock 120-142 Hz {stock}, retuned {retuned}"

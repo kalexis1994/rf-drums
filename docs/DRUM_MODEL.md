@@ -95,6 +95,60 @@ wave ending the contact) is planned, and the piano's version is the template
 — including its documented defect list, so the hammer-never-separates trap
 is known before it is stepped in.
 
+### The crack: the stick's own impact (tested)
+
+The user's first listening verdict — "suena como samples de batería
+electrónica tipo 808" — was this section's absence, plus the three after it.
+A drum hit's first ten milliseconds are mostly broadband noise, the stick
+striking the head as a plate before modal motion establishes, and no
+arrangement of modal amplitudes can stand in for it (the piano's action-noise
+lesson, which percussion pays double: there its absence measured 25–31 dB).
+Rendered as an exponentially dying, one-pole low-passed noise burst per
+strike: bandwidth tied to the same contact time that filters the ladder
+(hard blow → shorter contact → brighter crack), level on the Crack fader.
+`the_attack_cracks_and_the_sustain_rings` holds attack-vs-sustain noisiness
+on the rendered audio.
+
+### Tension-modulation glide (tested)
+
+A struck membrane is stretched by its own displacement: every mode starts
+sharp and settles as the amplitude dies — Kirchhoff–Carrier, far larger on a
+drumhead than on the piano's strings because the head moves millimetres. The
+glide follows velocity² (an amplitude effect, absent pianissimo), reaches
+~+1 semitone fortissimo and relaxes over ~50 ms at control rate by rebuilding
+each rotation from its stored rest frequency — exactly norm-preserving, so
+the piano's glide bug (decay factors scaled by √(1+step²) until A0 diverged)
+cannot occur by construction. The 808 *fakes* this curve with a pitch
+envelope; a model with neither the glide nor the crack reads as the 808.
+
+### Degenerate twin pairs (tested)
+
+Every `cos(mθ)` mode has a `sin(mθ)` twin at the same ideal frequency; real
+heads split each pair a few cents through non-uniform hoop tension, and the
+slow beat between twins is what makes a drum partial breathe instead of
+holding a synthesizer's dead-straight sine (Rossing on near-degenerate pairs
+in real drums). Both twins speak on every off-centre strike, split ~0.4% with
+per-(drum, mode) jitter — uniform splitting would beat every partial at a
+rate proportional to frequency, the piano's documented "shimmer" defect.
+
+### The shell (tested, stated simplification)
+
+The drum's wooden body: four stiff resonances above the head's pitch
+(ratios ~3.3–8.4×, jittered per drum), dying at spruce-order loss
+(η ≈ 3%, T60 = ln10³/(π·f·η) — tens of milliseconds), knocked at the strike.
+The honest model drives the shell continuously through the bearing edge;
+strike-seeding is the stated simplification, the same one the piano's clack
+accepts. Level on the Shell fader.
+
+### The contact's brightness constant (empirical, stated)
+
+The modal low-pass at a naive `1/(π·t_contact)` put the floor tom's cutoff at
+127 Hz and buried the entire Bessel ladder — fundamentals alone left
+standing, which IS an 808 tom. The piano's ledger states the identical
+lesson: a strict reciprocal reading "comes out far darker than measured,
+because the felt hardens during contact". A stick tip on Mylar hardens more.
+`CONTACT_BRIGHTNESS = 8` is empirical and stated as such until targets exist.
+
 ### Rendering (tested)
 
 Modal synthesis, the Concert Grand's engine: each mode is a damped quadrature

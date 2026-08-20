@@ -118,6 +118,8 @@ const FIELDS = [
   { key: "contact_s",        name: "Contact",  min: 0.0004, max: 0.02,  log: true,  fmt: v => (v * 1000).toFixed(2) + " ms" },
   { key: "strike_radius",    name: "Radius",   min: 0.02,   max: 0.98,  log: false, fmt: v => v.toFixed(2) },
   { key: "gain",             name: "Gain",     min: 0,      max: 4,     log: false, fmt: v => v.toFixed(2) },
+  { key: "crack",            name: "Crack",    min: 0,      max: 4,     log: false, fmt: v => v.toFixed(2) },
+  { key: "shell",            name: "Shell",    min: 0,      max: 4,     log: false, fmt: v => v.toFixed(2) },
 ];
 
 const statusEl = document.getElementById("status");
